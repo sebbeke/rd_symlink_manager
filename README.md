@@ -1,4 +1,4 @@
-# Real-Debrid Symlink Manager + Downloader  
+# Real-Debrid Symlink  + RD Unrestrict Downloader  
 **All-in-One Solution for (Movies|Anime|Shows) - Direct Media Server Integration with Multi-Path Support**
 
 [![Docker](https://img.shields.io/badge/Docker-Ready-blue.svg)](https://docs.docker.com)
