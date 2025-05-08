@@ -101,6 +101,22 @@ const config = {
 git clone https://github.com/ericvlog/rd_symlink_manager.git
 cd rd_symlink_manager
 cp .env.example .env  # Configure with your API tokens/paths
+# Create directories from your .env paths
+mkdir -p \
+    "${SYMLINK_BASE_PATH}" \
+    "${DOWNLOAD_INCOMPLETE_PATH}" \
+    "${DOWNLOAD_COMPLETE_PATH}"
+
+# Set permissions once
+sudo chown -R 1000:1000 \
+    "${SYMLINK_BASE_PATH}" \
+    "${DOWNLOAD_INCOMPLETE_PATH}" \
+    "${DOWNLOAD_COMPLETE_PATH}"
+
+sudo chmod -R 2775 \
+    "${SYMLINK_BASE_PATH}" \
+    "${DOWNLOAD_INCOMPLETE_PATH}" \
+    "${DOWNLOAD_COMPLETE_PATH}"
 docker compose up -d --build
 ```
 

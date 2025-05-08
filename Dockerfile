@@ -1,36 +1,21 @@
 FROM python:3.11-slim
 
-ARG UID=1000
-ARG GID=1000
-ARG USERNAME=appuser
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gosu \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN groupadd -g ${GID} ${USERNAME} && \
-    useradd -u ${UID} -g ${GID} -s /bin/bash -m ${USERNAME}
+RUN groupadd -g 1000 appuser && \
+    useradd -u 1000 -g appuser -m -s /bin/bash appuser
 
 WORKDIR /app
+COPY ./app/ .
+COPY requirements.txt .
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc python3-dev curl gosu && \
-    pip install --no-cache-dir flask requests && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir -r requirements.txt && \
+    chmod +x entrypoint.sh && \
+    chown -R appuser:appuser /app
 
-RUN mkdir -p /logs && \
-    chown ${USERNAME}:${USERNAME} /logs && \
-    chmod 755 /logs
+USER appuser
 
-COPY ./app/rd_symlink_backend.py .
-COPY ./app/entrypoint.sh .
-
-RUN chmod +x entrypoint.sh && \
-    chown -R ${USERNAME}:${USERNAME} /app
-
-HEALTHCHECK --interval=2m --timeout=10s --start-period=1m \
-  CMD curl -f "http://localhost:${PORT}/health" || exit 1
-
-EXPOSE ${PORT}
-
-ENTRYPOINT ["./entrypoint.sh"]
-CMD ["python", "rd_symlink_backend.py"]
-
-USER ${USERNAME}
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["python", "-u", "rd_symlink_backend.py"]
