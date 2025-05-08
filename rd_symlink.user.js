@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         RD Symlink Manager v1.06
+// @name         RD Symlink Manager
 // @namespace    http://tampermonkey.net/
-// @version      24.7.1
+// @version      1.0.6
 // @description  Integrated solution with direct RD downloads and symlinking
 // @author       You
 // @match        *://*/*
