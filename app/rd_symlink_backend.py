@@ -17,7 +17,7 @@ app = Flask(__name__)
 # ======================
 # ENVIRONMENT CONFIG
 # ======================
-RD_API_KEY = os.getenv("RD_API_KEY", "***REMOVED***")
+RD_API_KEY = os.getenv("RD_API_KEY")
 MEDIA_SERVER = os.getenv("MEDIA_SERVER", "plex").lower()
 ENABLE_DOWNLOADS = os.getenv("ENABLE_DOWNLOADS", "false").lower() == "true"
 
