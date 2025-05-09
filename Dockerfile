@@ -1,21 +1,19 @@
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gosu \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN groupadd -g 1000 appuser && \
-    useradd -u 1000 -g appuser -m -s /bin/bash appuser
-
 WORKDIR /app
+
+# Install dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc python3-dev curl && \
+    pip install --no-cache-dir flask requests bencode.py && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Make /app writable
+RUN chmod 777 /app
+
 COPY ./app/ .
-COPY requirements.txt .
 
-RUN pip install --no-cache-dir -r requirements.txt && \
-    chmod +x entrypoint.sh && \
-    chown -R appuser:appuser /app
+EXPOSE ${PORT:-5005}
 
-USER appuser
-
-ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["python", "-u", "rd_symlink_backend.py"]
+CMD ["python", "rd_symlink_backend.py"]

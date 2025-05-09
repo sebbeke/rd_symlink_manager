@@ -2,22 +2,18 @@ version: "3.8"
 
 services:
   rd-symlink-backend:
-    build:
-      context: .
-      args:
-        UID: "${UID:-1000}"
-        GID: "${GID:-1000}"
+    build: .
     container_name: ${CONTAINER_NAME:-rd_symlink_manager_default}
     user: "${UID}:${GID}"
     network_mode: host
     env_file: .env
     volumes:
       - ${RCLONE_MOUNT_PATH}:${RCLONE_MOUNT_PATH}:ro
-      - ${SYMLINK_BASE_PATH}:/symlink
-      - ${FINAL_LIBRARY_PATH}:/library
-      - ${DOWNLOAD_INCOMPLETE_PATH}:/dl_incomplete
-      - ${DOWNLOAD_COMPLETE_PATH}:/dl_complete
-      - ./app/logs:/logs
+      - ${SYMLINK_BASE_PATH}:${SYMLINK_BASE_PATH}
+      - ${FINAL_LIBRARY_PATH}:${FINAL_LIBRARY_PATH}
+      - ${HOST_DOWNLOAD_INCOMPLETE_PATH}:/dl_incomplete
+      - ${HOST_DOWNLOAD_COMPLETE_PATH}:/dl_complete
+      - ./logs:/logs
     restart: unless-stopped
     logging:
       driver: "json-file"

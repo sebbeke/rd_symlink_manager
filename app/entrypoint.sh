@@ -1,5 +1,3 @@
 #!/bin/bash
-set -e
-
-# Directly execute the command without directory handling
+# No permission management - direct passthrough
 exec "$@"
