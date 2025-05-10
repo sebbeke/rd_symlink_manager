@@ -23,18 +23,19 @@ ENABLE_DOWNLOADS = os.getenv("ENABLE_DOWNLOADS", "false").lower() == "true"
 
 # Path configuration
 SYMLINK_BASE_PATH = Path(os.getenv("SYMLINK_BASE_PATH", "/symlinks"))
-DOWNLOAD_INCOMPLETE_PATH = Path(os.getenv("DOWNLOAD_INCOMPLETE_PATH", "/dl_incomplete"))
 DOWNLOAD_COMPLETE_PATH = Path(os.getenv("DOWNLOAD_COMPLETE_PATH", "/dl_complete"))
 FINAL_LIBRARY_PATH = Path(os.getenv("FINAL_LIBRARY_PATH", "/library"))
 RCLONE_MOUNT_PATH = Path(os.getenv("RCLONE_MOUNT_PATH", "/mnt/data/media/remote/realdebrid/__all__"))
 
 # Media server config
-PLEX_TOKEN = os.getenv("PLEX_TOKEN", "your_plex_token")
-PLEX_LIBRARY_NAME = os.getenv("PLEX_LIBRARY_NAME", "Jav")
-PLEX_SERVER_IP = os.getenv("PLEX_SERVER_IP", "192.168.1.100")
+PLEX_TOKEN = os.getenv("PLEX_TOKEN")
+PLEX_LIBRARY_NAME = os.getenv("PLEX_LIBRARY_NAME")
+PLEX_SERVER_IP = os.getenv("PLEX_SERVER_IP")
+EMBY_SERVER_IP = os.getenv("EMBY_SERVER_IP")
+EMBY_API_KEY = os.getenv("EMBY_API_KEY")
 
 # Advanced
-MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", 3))
+MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "3"))
 DELETE_AFTER_COPY = os.getenv("DELETE_AFTER_COPY", "false").lower() == "true"
 REMOVE_WORDS = [w.strip() for w in os.getenv("REMOVE_WORDS", "").split(",") if w.strip()]
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
@@ -46,6 +47,7 @@ LOG_FILE = os.getenv("SYMLINK_LOG_FILE", "symlink_backend.log")
 plex_section_id = None
 plex_initialized = False
 task_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_TASKS)
+download_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_TASKS)
 request_queue = deque()
 queue_lock = threading.Lock()
 active_tasks = set()
@@ -69,7 +71,7 @@ class TaskWorker(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self.running = True
-        
+
     def run(self):
         while self.running:
             try:
@@ -77,7 +79,7 @@ class TaskWorker(threading.Thread):
                 with queue_lock:
                     if request_queue:
                         task_id, raw_data = request_queue.popleft()
-                        
+
                 if raw_data:
                     with task_semaphore:
                         try:
@@ -89,7 +91,7 @@ class TaskWorker(threading.Thread):
                             ):
                                 data = request.get_json()
                                 response = process_symlink_creation(data)
-                                
+
                                 if response[1] != 200:
                                     logging.error(f"Task {task_id} failed: {response[0].json}")
                         except Exception as e:
@@ -147,75 +149,74 @@ def clean_filename(original_name):
     cleaned = original_name
     for pattern in REMOVE_WORDS:
         cleaned = re.sub(rf"{re.escape(pattern)}", "", cleaned, flags=re.IGNORECASE)
-    
+
     name_part, ext_part = os.path.splitext(cleaned)
     name_part = re.sub(r"_(\d+)(?=\.\w+$|$)", r"-cd\1", name_part)
     name_part = re.sub(r"[\W_]+", "-", name_part).strip("-")
     return f"{name_part or 'file'}"
 
 def log_download_speed(torrent_id, dest_path):
-    temp_path = None
-    try:
-        DOWNLOAD_INCOMPLETE_PATH.mkdir(parents=True, exist_ok=True)
-        temp_path = DOWNLOAD_INCOMPLETE_PATH / f"tmp_{dest_path.name}"
-        final_dir = DOWNLOAD_COMPLETE_PATH / dest_path.parent.name
-        final_dir.mkdir(parents=True, exist_ok=True)
-        final_path = final_dir / dest_path.name
+    with download_semaphore:
+        temp_path = None
+        try:
+            dest_dir = dest_path.parent
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            temp_path = dest_dir / f"{dest_path.name}.tmp"
 
-        restricted_links = get_restricted_links(torrent_id)
-        if not restricted_links:
-            raise Exception("No downloadable links found")
+            restricted_links = get_restricted_links(torrent_id)
+            if not restricted_links:
+                raise Exception("No downloadable links found")
 
-        download_url = unrestrict_link(restricted_links[0])
-        logging.info(
-            f"Download initialized\n"
-            f"|-> Source: {download_url}\n"
-            f"|-> Temp: {temp_path}\n"
-            f"|-> Final: {final_path}"
-        )
-
-        with requests.get(download_url, stream=True, timeout=(10, 300)) as r:
-            r.raise_for_status()
-            total_size = int(r.headers.get("content-length", 0))
-            bytes_copied = 0
-            start_time = time.time()
-            last_log = start_time
-
-            with open(temp_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=10*1024*1024):
-                    if chunk:
-                        f.write(chunk)
-                        bytes_copied += len(chunk)
-
-                        if time.time() - last_log >= 3:
-                            elapsed = time.time() - start_time
-                            speed = bytes_copied / elapsed
-                            with speed_lock:
-                                download_speeds.append(speed)
-                            logging.info(
-                                f"[Downloading] {dest_path.name} | "
-                                f"Progress: {bytes_copied/total_size:.1%} | "
-                                f"Speed: {speed/1024/1024:.2f} MB/s"
-                            )
-                            last_log = time.time()
-
-        shutil.move(temp_path, final_path)
-        logging.info(f"Download completed: {final_path}")
-
-        if DELETE_AFTER_COPY:
-            headers = {"Authorization": f"Bearer {RD_API_KEY}"}
-            requests.delete(
-                f"https://api.real-debrid.com/rest/1.0/torrents/delete/{torrent_id}",
-                headers=headers,
-                timeout=10
+            download_url = unrestrict_link(restricted_links[0])
+            logging.info(
+                f"Download initialized\n"
+                f"|-> Source: {download_url}\n"
+                f"|-> Temp: {temp_path}\n"
+                f"|-> Final: {dest_path}"
             )
 
-        trigger_media_scan(final_path)
+            with requests.get(download_url, stream=True, timeout=(10, 300)) as r:
+                r.raise_for_status()
+                total_size = int(r.headers.get("content-length", 0))
+                bytes_copied = 0
+                start_time = time.time()
+                last_log = start_time
 
-    except Exception as e:
-        logging.error(f"Download failed: {str(e)}")
-        if temp_path and temp_path.exists():
-            temp_path.unlink()
+                with open(temp_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=10*1024*1024):
+                        if chunk:
+                            f.write(chunk)
+                            bytes_copied += len(chunk)
+
+                            if time.time() - last_log >= 3:
+                                elapsed = time.time() - start_time
+                                speed = bytes_copied / elapsed
+                                with speed_lock:
+                                    download_speeds.append(speed)
+                                logging.info(
+                                    f"[Downloading] {dest_path.name} | "
+                                    f"Progress: {bytes_copied/total_size:.1%} | "
+                                    f"Speed: {speed/1024/1024:.2f} MB/s"
+                                )
+                                last_log = time.time()
+
+            shutil.move(temp_path, dest_path)
+            logging.info(f"Download completed: {dest_path}")
+
+            if DELETE_AFTER_COPY:
+                headers = {"Authorization": f"Bearer {RD_API_KEY}"}
+                requests.delete(
+                    f"https://api.real-debrid.com/rest/1.0/torrents/delete/{torrent_id}",
+                    headers=headers,
+                    timeout=10
+                )
+
+            trigger_media_scan(dest_path)
+
+        except Exception as e:
+            logging.error(f"Download failed: {str(e)}")
+            if temp_path and temp_path.exists():
+                temp_path.unlink()
 
 def get_plex_section_id():
     global plex_section_id, plex_initialized
@@ -261,10 +262,47 @@ def trigger_plex_scan(path):
         logging.error(f"Plex scan error: {str(e)}")
         return False
 
+def trigger_emby_scan(path):
+    try:
+        libs_response = requests.get(
+            f"http://{EMBY_SERVER_IP}/emby/Library/VirtualFolders",
+            headers={"X-Emby-Token": EMBY_API_KEY},
+            timeout=10
+        )
+        libs_response.raise_for_status()
+
+        library_id = None
+        for lib in libs_response.json():
+            if lib['Name'] == PLEX_LIBRARY_NAME:
+                library_id = lib['ItemId']
+                break
+
+        if not library_id:
+            logging.error("Emby library not found")
+            return False
+
+        scan_response = requests.post(
+            f"http://{EMBY_SERVER_IP}/emby/Library/Refresh",
+            headers={"X-Emby-Token": EMBY_API_KEY},
+            params={"Recursive": "true", "Path": str(path.parent)},
+            timeout=15
+        )
+        return scan_response.status_code == 204
+
+    except Exception as e:
+        logging.error(f"Emby scan error: {str(e)}")
+        return False
+
 def trigger_media_scan(path):
-    if MEDIA_SERVER == "plex":
-        return trigger_plex_scan(path)
-    return False
+    try:
+        if MEDIA_SERVER == "plex":
+            return trigger_plex_scan(path)
+        elif MEDIA_SERVER == "emby":
+            return trigger_emby_scan(path)
+        return False
+    except Exception as e:
+        logging.error(f"Media scan failed: {str(e)}")
+        return False
 
 def process_symlink_creation(data):
     try:
@@ -357,6 +395,6 @@ if __name__ == "__main__":
     workers = [TaskWorker() for _ in range(MAX_CONCURRENT_TASKS * 2)]
     for w in workers:
         w.start()
-        
+
     threading.Thread(target=log_total_speed, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5002")), threaded=True)

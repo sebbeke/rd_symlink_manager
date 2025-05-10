@@ -11,8 +11,7 @@ services:
       - ${RCLONE_MOUNT_PATH}:${RCLONE_MOUNT_PATH}:ro
       - ${SYMLINK_BASE_PATH}:${SYMLINK_BASE_PATH}
       - ${FINAL_LIBRARY_PATH}:${FINAL_LIBRARY_PATH}
-      - ${HOST_DOWNLOAD_INCOMPLETE_PATH}:/dl_incomplete
-      - ${HOST_DOWNLOAD_COMPLETE_PATH}:/dl_complete
+      - ${DOWNLOAD_COMPLETE_PATH}:/dl_complete
       - ./logs:/logs
     restart: unless-stopped
     logging:
