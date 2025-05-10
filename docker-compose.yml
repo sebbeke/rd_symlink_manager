@@ -12,7 +12,7 @@ services:
       - ${SYMLINK_BASE_PATH}:${SYMLINK_BASE_PATH}
       - ${FINAL_LIBRARY_PATH}:${FINAL_LIBRARY_PATH}
       - ${DOWNLOAD_COMPLETE_PATH}:/dl_complete
-      - ./logs:/logs
+      - ${LOGS_PATH}:/logs
     restart: unless-stopped
     logging:
       driver: "json-file"
