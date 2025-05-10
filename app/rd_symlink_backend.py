@@ -20,6 +20,7 @@ app = Flask(__name__)
 RD_API_KEY = os.getenv("RD_API_KEY")
 MEDIA_SERVER = os.getenv("MEDIA_SERVER", "plex").lower()
 ENABLE_DOWNLOADS = os.getenv("ENABLE_DOWNLOADS", "false").lower() == "true"
+MOVE_TO_FINAL_LIBRARY = os.getenv("MOVE_TO_FINAL_LIBRARY", "true").lower() == "true"
 
 # Path configuration
 SYMLINK_BASE_PATH = Path(os.getenv("SYMLINK_BASE_PATH", "/symlinks"))
@@ -33,6 +34,7 @@ PLEX_LIBRARY_NAME = os.getenv("PLEX_LIBRARY_NAME")
 PLEX_SERVER_IP = os.getenv("PLEX_SERVER_IP")
 EMBY_SERVER_IP = os.getenv("EMBY_SERVER_IP")
 EMBY_API_KEY = os.getenv("EMBY_API_KEY")
+EMBY_LIBRARY_NAME = os.getenv("EMBY_LIBRARY_NAME")  # New variable
 
 # Advanced
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "3"))
@@ -40,6 +42,7 @@ DELETE_AFTER_COPY = os.getenv("DELETE_AFTER_COPY", "false").lower() == "true"
 REMOVE_WORDS = [w.strip() for w in os.getenv("REMOVE_WORDS", "").split(",") if w.strip()]
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_FILE = os.getenv("SYMLINK_LOG_FILE", "symlink_backend.log")
+SCAN_DELAY = int(os.getenv("SCAN_DELAY", "60"))
 
 # ======================
 # GLOBAL STATE
@@ -93,7 +96,7 @@ class TaskWorker(threading.Thread):
                                 response = process_symlink_creation(data)
 
                                 if response[1] != 200:
-                                    logging.error(f"Task {task_id} failed: {response[0].json}")
+                                    logging.error(f"Task {task_id} failed: {response[0].get_json()}")
                         except Exception as e:
                             logging.error(f"Task {task_id} processing failed: {str(e)}")
                         finally:
@@ -159,7 +162,17 @@ def log_download_speed(torrent_id, dest_path):
     with download_semaphore:
         temp_path = None
         try:
-            dest_dir = dest_path.parent
+            headers = {"Authorization": f"Bearer {RD_API_KEY}"}
+            response = requests.get(
+                f"https://api.real-debrid.com/rest/1.0/torrents/info/{torrent_id}",
+                headers=headers,
+                timeout=15
+            )
+            response.raise_for_status()
+            torrent_info = response.json()
+            
+            base_name = clean_filename(os.path.splitext(torrent_info["filename"])[0])
+            dest_dir = DOWNLOAD_COMPLETE_PATH / base_name
             dest_dir.mkdir(parents=True, exist_ok=True)
             temp_path = dest_dir / f"{dest_path.name}.tmp"
 
@@ -200,18 +213,29 @@ def log_download_speed(torrent_id, dest_path):
                                 )
                                 last_log = time.time()
 
-            shutil.move(temp_path, dest_path)
-            logging.info(f"Download completed: {dest_path}")
+            temp_path.rename(dest_dir / dest_path.name)
+            logging.info(f"Download completed: {dest_dir / dest_path.name}")
 
-            if DELETE_AFTER_COPY:
-                headers = {"Authorization": f"Bearer {RD_API_KEY}"}
-                requests.delete(
-                    f"https://api.real-debrid.com/rest/1.0/torrents/delete/{torrent_id}",
-                    headers=headers,
-                    timeout=10
-                )
+            if MOVE_TO_FINAL_LIBRARY:
+                final_path = FINAL_LIBRARY_PATH / dest_path.relative_to(DOWNLOAD_COMPLETE_PATH)
+                final_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(dest_dir / dest_path.name, final_path)
+                logging.info(f"Moved to final library: {final_path}")
 
-            trigger_media_scan(dest_path)
+                try:
+                    if not any(dest_dir.iterdir()):
+                        dest_dir.rmdir()
+                        logging.info(f"Cleaned empty directory: {dest_dir}")
+                except Exception as e:
+                    logging.error(f"Directory cleanup failed: {str(e)}")
+
+                scan_path = final_path
+            else:
+                scan_path = FINAL_LIBRARY_PATH
+                logging.info(f"File retained in downloads: {dest_dir / dest_path.name}")
+
+            time.sleep(SCAN_DELAY)
+            trigger_media_scan(scan_path)
 
         except Exception as e:
             logging.error(f"Download failed: {str(e)}")
@@ -247,48 +271,58 @@ def trigger_plex_scan(path):
     try:
         section_id = get_plex_section_id()
         if not section_id:
+            logging.error("Plex section ID not resolved. Check library name or token.")
             return False
 
-        rel_path = path.relative_to(FINAL_LIBRARY_PATH if ENABLE_DOWNLOADS else SYMLINK_BASE_PATH)
-        encoded_path = "/".join([urllib.parse.quote(p.name) for p in rel_path.parents[::-1]][:-1])
+        if ENABLE_DOWNLOADS:
+            base_path = FINAL_LIBRARY_PATH if MOVE_TO_FINAL_LIBRARY else DOWNLOAD_COMPLETE_PATH
+        else:
+            base_path = SYMLINK_BASE_PATH
+
+        try:
+            rel_path = path.relative_to(base_path)
+            encoded_path = "/".join([urllib.parse.quote(p.name) for p in rel_path.parents[::-1]][:-1])
+        except ValueError:
+            logging.error(f"Path {path} is not relative to {base_path}. Check path mappings.")
+            return False
 
         response = requests.get(
             f"http://{PLEX_SERVER_IP}:32400/library/sections/{section_id}/refresh",
             params={"path": encoded_path, "X-Plex-Token": PLEX_TOKEN},
             timeout=15
         )
+        logging.info(f"Plex scan response code: {response.status_code}")
         return response.status_code == 200
     except Exception as e:
-        logging.error(f"Plex scan error: {str(e)}")
+        logging.error(f"Plex scan error: {str(e)}", exc_info=True)
         return False
 
 def trigger_emby_scan(path):
     try:
-        libs_response = requests.get(
-            f"http://{EMBY_SERVER_IP}/emby/Library/VirtualFolders",
-            headers={"X-Emby-Token": EMBY_API_KEY},
-            timeout=10
-        )
-        libs_response.raise_for_status()
+        libs_url = f"http://{EMBY_SERVER_IP}/emby/Library/VirtualFolders?api_key={EMBY_API_KEY}"
+        libs_response = requests.get(libs_url, timeout=10)
+        
+        if libs_response.status_code != 200:
+            logging.error(f"Emby API failed: {libs_response.status_code}")
+            return False
 
         library_id = None
         for lib in libs_response.json():
-            if lib['Name'] == PLEX_LIBRARY_NAME:
+            if lib['Name'] == EMBY_LIBRARY_NAME:
                 library_id = lib['ItemId']
                 break
 
         if not library_id:
-            logging.error("Emby library not found")
+            logging.error(f"Emby library '{EMBY_LIBRARY_NAME}' not found")
             return False
 
+        scan_url = f"http://{EMBY_SERVER_IP}/emby/Library/Refresh?api_key={EMBY_API_KEY}"
         scan_response = requests.post(
-            f"http://{EMBY_SERVER_IP}/emby/Library/Refresh",
-            headers={"X-Emby-Token": EMBY_API_KEY},
-            params={"Recursive": "true", "Path": str(path.parent)},
+            scan_url,
+            params={"Recursive": "true", "Path": str(path)},
             timeout=15
         )
-        return scan_response.status_code == 204
-
+        return scan_response.status_code in [200, 204]
     except Exception as e:
         logging.error(f"Emby scan error: {str(e)}")
         return False
@@ -298,7 +332,18 @@ def trigger_media_scan(path):
         if MEDIA_SERVER == "plex":
             return trigger_plex_scan(path)
         elif MEDIA_SERVER == "emby":
-            return trigger_emby_scan(path)
+            if ENABLE_DOWNLOADS:
+                base_path = FINAL_LIBRARY_PATH if MOVE_TO_FINAL_LIBRARY else DOWNLOAD_COMPLETE_PATH
+            else:
+                base_path = SYMLINK_BASE_PATH
+            
+            try:
+                rel_path = path.relative_to(base_path)
+                emby_scan_path = base_path / rel_path.parent
+            except ValueError:
+                emby_scan_path = base_path
+            
+            return trigger_emby_scan(emby_scan_path)
         return False
     except Exception as e:
         logging.error(f"Media scan failed: {str(e)}")
@@ -323,7 +368,7 @@ def process_symlink_creation(data):
             return jsonify({"error": "No files selected"}), 400
 
         created_paths = []
-        base_dir = FINAL_LIBRARY_PATH if ENABLE_DOWNLOADS else SYMLINK_BASE_PATH
+        base_dir = DOWNLOAD_COMPLETE_PATH if ENABLE_DOWNLOADS else SYMLINK_BASE_PATH
         base_name = clean_filename(os.path.splitext(torrent_info["filename"])[0])
         dest_dir = base_dir / base_name
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -341,11 +386,14 @@ def process_symlink_creation(data):
                     ).start()
                 else:
                     src_path = RCLONE_MOUNT_PATH / torrent_info["filename"] / file_path
-                    dest_path.symlink_to(src_path)
-                    logging.info(f"Symlink created: {dest_path} → {src_path}")
+                    if dest_path.exists():
+                        logging.warning(f"Symlink already exists: {dest_path}")
+                    else:
+                        dest_path.symlink_to(src_path)
+                        logging.info(f"Symlink created: {dest_path} → {src_path}")
+                    trigger_media_scan(dest_path)
 
                 created_paths.append(str(dest_path))
-                trigger_media_scan(dest_path)
 
             except Exception as e:
                 logging.error(f"File error: {str(e)}")
