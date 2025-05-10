@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RD Symlink Manager
 // @namespace    http://tampermonkey.net/
-// @version      1.0.7
+// @version      2.0
 // @description  Integrated solution with direct RD downloads and symlinking
 // @author       You
 // @match        *://*/*
@@ -29,25 +29,10 @@
         minFileSize: 50 * 1024 * 1024,
         retryDelay: 30000,
         maxRetries: 15,
-        maxHistoryItems: 200
+        maxHistoryItems: 200,
+        syncInterval: 1000
     };
-async function checkBackendHealth() {
-  return new Promise((resolve, reject) => {
-    GM_xmlhttpRequest({
-      method: 'GET',
-      url: `${config.backendUrl}/health`,
-      timeout: 5000,
-      onload: (res) => {
-        if (res.status === 200) {
-          resolve(true); // Backend is healthy
-        } else {
-          reject(new Error(`HTTP ${res.status}`));
-        }
-      },
-      onerror: (err) => reject(new Error(err.statusText || 'Connection failed'))
-    });
-  });
-}
+
     const instanceKey = config.instanceName.toLowerCase().replace(/[^a-z0-9]/g, '_');
     const storageKeys = {
         tasks: `rd_tasks_${instanceKey}`,
@@ -73,19 +58,44 @@ async function checkBackendHealth() {
         GM_setValue(storageKeys.clickedHashes, JSON.stringify(clickedHashes));
     }
 
-    function handleStorageUpdate(e) {
-        if ([storageKeys.tasks, storageKeys.activeTasks, storageKeys.clickedHashes].includes(e.key)) {
-            tasks = JSON.parse(GM_getValue(storageKeys.tasks, '[]'));
-            activeTasks = JSON.parse(GM_getValue(storageKeys.activeTasks, '{}'));
-            clickedHashes = JSON.parse(GM_getValue(storageKeys.clickedHashes, '{}'));
+    setInterval(() => checkForStorageUpdates(), config.syncInterval);
+    setInterval(saveActiveTasks, 30000);
+    uw.addEventListener('beforeunload', saveActiveTasks);
+
+    function checkForStorageUpdates() {
+        const storedTasks = JSON.parse(GM_getValue(storageKeys.tasks, '[]'));
+        const storedActiveTasks = JSON.parse(GM_getValue(storageKeys.activeTasks, '{}'));
+        const storedClickedHashes = JSON.parse(GM_getValue(storageKeys.clickedHashes, '{}'));
+
+        let changed = false;
+
+        if (JSON.stringify(storedTasks) !== JSON.stringify(tasks)) {
+            tasks = storedTasks;
+            changed = true;
+        }
+
+        if (JSON.stringify(storedActiveTasks) !== JSON.stringify(activeTasks)) {
+            activeTasks = storedActiveTasks;
+            changed = true;
+            Object.values(activeTasks).forEach(task => {
+                if (['pending', 'processing', 'downloading', 'symlinking'].includes(task.status) && !task._isProcessing) {
+                    task._isProcessing = true;
+                    startProcessing(task.magnet, null, task.mode, task.id)
+                        .catch(() => updateTask(task.id, { status: 'failed' }));
+                }
+            });
+        }
+
+        if (JSON.stringify(storedClickedHashes) !== JSON.stringify(clickedHashes)) {
+            clickedHashes = storedClickedHashes;
+            changed = true;
+        }
+
+        if (changed) {
             updateTaskManager();
             updateButtonStates();
         }
     }
-
-    setInterval(saveActiveTasks, 30000);
-    uw.addEventListener('beforeunload', saveActiveTasks);
-    uw.addEventListener('storage', handleStorageUpdate);
 
     function getMagnetHash(magnetUrl) {
         const hashMatch = magnetUrl.match(/xt=urn:btih:([^&]+)/i);
@@ -820,58 +830,43 @@ async function checkBackendHealth() {
         showStatus("Marked as done!", '#2ecc71', 2000);
     }
 
-async function initUI() {
-  try {
-    // === IMMEDIATE UI INITIALIZATION ===
-    createTaskManager();
-    createTaskManagerToggle();
-    updateTaskManager();
+    function initUI() {
+        createTaskManager();
+        createTaskManagerToggle();
+        updateTaskManager();
 
-    // Setup mutation observer
-    const observer = new uw.MutationObserver(() => {
-      uw.document.querySelectorAll('a[href^="magnet:"]').forEach(link => {
-        if (!link.nextElementSibling?.classList?.contains('rd-magnet-button')) {
-          const btn = uw.document.createElement('button');
-          btn.className = 'rd-magnet-button';
-          btn.setAttribute('data-magnet', link.href);
-          btn.addEventListener('click', handleButtonClick);
-          link.parentNode.insertBefore(btn, link.nextSibling);
-        }
-      });
-      debouncedUpdateButtonStates();
-    });
-    observer.observe(uw.document.body, { childList: true, subtree: true });
+        const processMagnetLinks = () => {
+            uw.document.querySelectorAll('a[href^="magnet:"]').forEach(link => {
+                if (!link.nextElementSibling?.classList?.contains('rd-magnet-button')) {
+                    const btn = uw.document.createElement('button');
+                    btn.className = 'rd-magnet-button';
+                    btn.setAttribute('data-magnet', link.href);
+                    btn.addEventListener('click', handleButtonClick);
+                    link.insertAdjacentElement('afterend', btn);
+                }
+            });
+            debouncedUpdateButtonStates();
+        };
 
-    debouncedUpdateButtonStates();
+        // Initial processing
+        processMagnetLinks();
 
-    // === START BACKGROUND HEALTH CHECK ===
-    checkBackendHealth()
-      .then(() => {
-        // Backend is healthy - restart active tasks
-        Object.values(activeTasks).forEach(task => {
-          if (['pending', 'processing', 'downloading', 'symlinking'].includes(task.status)) {
-            startProcessing(task.magnet, null, task.mode, task.id)
-              .catch(() => updateTask(task.id, { status: 'failed' }));
-          }
+        // MutationObserver setup
+        const observer = new uw.MutationObserver(mutations => {
+            mutations.forEach(mutation => {
+                if (mutation.addedNodes.length) {
+                    processMagnetLinks();
+                }
+            });
         });
-      })
-      .catch(error => {
-        // Backend is unreachable - show warning but keep UI functional
-        showStatus(`Backend unreachable: ${error.message}`, '#e74c3c', 8000);
 
-        // Still allow manual task restarts
-        Object.values(activeTasks).forEach(task => {
-          if (['completed', 'done', 'failed'].includes(task.status)) return;
-          task.status = 'failed';
-          task.statusText = 'Backend unreachable';
-          updateTask(task.id, task);
+        observer.observe(uw.document.body, {
+            childList: true,
+            subtree: true
         });
-      });
 
-  } catch (error) {
-    showStatus("Extension initialization failed!", '#e74c3c', 5000);
-  }
-}
+        checkBackendHealth().catch(() => {});
+    }
 
     function handleButtonClick(e) {
         const button = e.currentTarget;
@@ -1046,10 +1041,26 @@ async function initUI() {
         }
     }
 
+    async function checkBackendHealth() {
+        try {
+            await new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url: `${config.backendUrl}/health`,
+                    timeout: 5000,
+                    onload: (res) => res.status === 200 ? resolve() : reject(),
+                    onerror: reject
+                });
+            });
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
     if (uw.document.readyState === 'loading') {
         uw.document.addEventListener('DOMContentLoaded', initUI);
     } else {
         initUI();
     }
 })();
-
