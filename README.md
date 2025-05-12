@@ -119,6 +119,9 @@ sudo chmod -R 2775 \
     "${DOWNLOAD_COMPLETE_PATH}"
 docker compose up -d --build
 ```
+## 📥 Installation Guide
+Follow along with our YouTube tutorial:  
+[![Installation Video](https://img.youtube.com/vi/bQid2AOE-o0/0.jpg)](https://youtu.be/bQid2AOE-o0)
 
 ## ⚙️ Requirements
 
@@ -152,4 +155,8 @@ docker compose up -d --build
 **Optimized for** Linux (Debian/Ubuntu) + Chrome/Edge  
 Report issues: [GitHub Issues](https://github.com/ericvlog/rd_symlink_manager/issues)
 
-
+## ☕ Support Development
+If this project helps you, consider supporting us:
+**Bitcoin (BTC):**  
+`1NizzCiosWryLMv51jp118MSjsN7FZQxjC`  
+![Bitcoin QR Code](https://bitcoinqr.dev/qr/1NizzCiosWryLMv51jp118MSjsN7FZQxjC?size=200)
