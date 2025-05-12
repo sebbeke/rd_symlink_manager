@@ -120,8 +120,9 @@ sudo chmod -R 2775 \
 docker compose up -d --build
 ```
 ## 📥 Installation Guide
-Follow along with our YouTube tutorial:  
-[![Installation Video](https://img.youtube.com/vi/bQid2AOE-o0/0.jpg)](https://youtu.be/bQid2AOE-o0)
+**Watch the step-by-step tutorial:**  
+[![Video Thumbnail](https://img.youtube.com/vi/F77i2ZAnb_w/mqdefault.jpg)](https://youtu.be/F77i2ZAnb_w)  
+[Full Video Link](https://youtu.be/F77i2ZAnb_w)
 
 ## ⚙️ Requirements
 
@@ -156,7 +157,7 @@ Follow along with our YouTube tutorial:
 Report issues: [GitHub Issues](https://github.com/ericvlog/rd_symlink_manager/issues)
 
 ## ☕ Support Development
-If this project helps you, consider supporting us:
+If this project helps you, consider supporting 
 **Bitcoin (BTC):**  
 `1NizzCiosWryLMv51jp118MSjsN7FZQxjC`  
-![Bitcoin QR Code](https://bitcoinqr.dev/qr/1NizzCiosWryLMv51jp118MSjsN7FZQxjC?size=200)
+![Bitcoin QR Code](https://blockchain.info/qr?data=1NizzCiosWryLMv51jp118MSjsN7FZQxjC&size=200)  
