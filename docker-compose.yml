@@ -7,6 +7,8 @@ services:
     user: "${UID}:${GID}"
     network_mode: host
     env_file: .env
+    environment:
+      - DOWNLOAD_COMPLETE_PATH=/dl_complete
     volumes:
       - ${RCLONE_MOUNT_PATH}:${RCLONE_MOUNT_PATH}:ro
       - ${SYMLINK_BASE_PATH}:${SYMLINK_BASE_PATH}
