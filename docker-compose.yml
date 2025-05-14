@@ -5,10 +5,11 @@ services:
     build: .
     container_name: ${CONTAINER_NAME:-rd_symlink_manager_default}
     user: "${UID}:${GID}"
-    network_mode: host
     env_file: .env
     environment:
       - DOWNLOAD_COMPLETE_PATH=/dl_complete
+    ports:
+      - "${PORT}:${PORT}"
     volumes:
       - ${RCLONE_MOUNT_PATH}:${RCLONE_MOUNT_PATH}:ro
       - ${SYMLINK_BASE_PATH}:${SYMLINK_BASE_PATH}
