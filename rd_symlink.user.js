@@ -1,30 +1,28 @@
+// === USERSCRIPT.TXT ===
 // ==UserScript==
 // @name         RD Symlink Manager
 // @namespace    http://tampermonkey.net/
 // @version      2.0
-// @description  Integrated solution with direct RD downloads and symlinking
-// @author       You
+// @description  Universal Real-Debrid client with symlink support
+// @author       Your Name
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setClipboard
 // @grant        GM_addStyle
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_registerMenuCommand
 // @grant        unsafeWindow
-// @connect      api.real-debrid.com
-// @connect      192.168.1.100
-// @connect      localhost
-// @noframes
+// @connect      *
 // ==/UserScript==
 
-(function () {
+(function() {
     'use strict';
     const uw = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
-    const config = {
-        instanceName: "Main",    // Unique identifier for multiple instances
-        rdApiKey: 'YOUR_API_KEY_HERE', // Get from Real-Debrid APItoken
-        backendUrl: 'http://localhost:5002', // Local server address
+    const CONFIG = {
+        backendUrl: GM_getValue('backendUrl', ''),
+        instanceName: GM_getValue('instanceName', 'default'),
         videoExtensions: new Set(['mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'm4v']),
         minFileSize: 50 * 1024 * 1024,
         retryDelay: 30000,
@@ -33,7 +31,54 @@
         syncInterval: 1000
     };
 
-    const instanceKey = config.instanceName.toLowerCase().replace(/[^a-z0-9]/g, '_');
+async function rdProxy(endpoint, method = 'GET', data = null) {
+    try {
+        const response = await new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url: `${CONFIG.backendUrl}/rd-proxy`,
+                headers: {'Content-Type': 'application/json'},
+                data: JSON.stringify({ endpoint, method, data }),
+                onload: (res) => {
+                    try {
+                        // Handle empty responses
+                        if (!res.responseText.trim()) {
+                            throw new Error(`Empty response (${res.status})`);
+                        }
+
+                        const data = JSON.parse(res.responseText);
+                        if (res.status >= 200 && res.status < 300) {
+                            resolve(data);
+                        } else {
+                            const errorDetails = [
+                                data.source && `Source: ${data.source}`,
+                                data.status && `Status: ${data.status}`,
+                                data.message || data.error
+                            ].filter(Boolean).join(' | ');
+                            reject(errorDetails);
+                        }
+                    } catch(e) {
+                        reject(`Invalid server response: ${res.responseText.slice(0, 100)}`);
+                    }
+                },
+                onerror: (err) => reject(`Connection failed: ${err.statusText}`)
+            });
+        });
+        return response;
+    } catch (error) {
+        throw new Error(`Real-Debrid Error: ${error}`);
+    }
+}
+
+    GM_registerMenuCommand('⚙️ Configure RD Manager', () => {
+        const url = prompt('Enter backend URL (http(s)://your-domain.com):', CONFIG.backendUrl);
+        if (url) GM_setValue('backendUrl', url);
+        const name = prompt('Instance name (optional):', CONFIG.instanceName);
+        if (name) GM_setValue('instanceName', name);
+        location.reload();
+    });
+
+    const instanceKey = CONFIG.instanceName.toLowerCase().replace(/[^a-z0-9]/g, '_');
     const storageKeys = {
         tasks: `rd_tasks_${instanceKey}`,
         activeTasks: `active_tasks_${instanceKey}`,
@@ -49,16 +94,13 @@
 
     function saveActiveTasks() {
         tasks = tasks.filter(t => t && t.magnet && getMagnetHash(t.magnet));
-        Object.keys(activeTasks).forEach(k => {
-            if (!activeTasks[k].magnet) delete activeTasks[k];
-        });
-
+        Object.keys(activeTasks).forEach(k => { if (!activeTasks[k].magnet) delete activeTasks[k]; });
         GM_setValue(storageKeys.activeTasks, JSON.stringify(activeTasks));
         GM_setValue(storageKeys.tasks, JSON.stringify(tasks));
         GM_setValue(storageKeys.clickedHashes, JSON.stringify(clickedHashes));
     }
 
-    setInterval(() => checkForStorageUpdates(), config.syncInterval);
+    setInterval(() => checkForStorageUpdates(), CONFIG.syncInterval);
     setInterval(saveActiveTasks, 30000);
     uw.addEventListener('beforeunload', saveActiveTasks);
 
@@ -66,14 +108,9 @@
         const storedTasks = JSON.parse(GM_getValue(storageKeys.tasks, '[]'));
         const storedActiveTasks = JSON.parse(GM_getValue(storageKeys.activeTasks, '{}'));
         const storedClickedHashes = JSON.parse(GM_getValue(storageKeys.clickedHashes, '{}'));
-
         let changed = false;
 
-        if (JSON.stringify(storedTasks) !== JSON.stringify(tasks)) {
-            tasks = storedTasks;
-            changed = true;
-        }
-
+        if (JSON.stringify(storedTasks) !== JSON.stringify(tasks)) { tasks = storedTasks; changed = true; }
         if (JSON.stringify(storedActiveTasks) !== JSON.stringify(activeTasks)) {
             activeTasks = storedActiveTasks;
             changed = true;
@@ -85,16 +122,8 @@
                 }
             });
         }
-
-        if (JSON.stringify(storedClickedHashes) !== JSON.stringify(clickedHashes)) {
-            clickedHashes = storedClickedHashes;
-            changed = true;
-        }
-
-        if (changed) {
-            updateTaskManager();
-            updateButtonStates();
-        }
+        if (JSON.stringify(storedClickedHashes) !== JSON.stringify(clickedHashes)) { clickedHashes = storedClickedHashes; changed = true; }
+        if (changed) { updateTaskManager(); updateButtonStates(); }
     }
 
     function getMagnetHash(magnetUrl) {
@@ -106,109 +135,29 @@
         try {
             const nameMatch = magnetUrl.match(/dn=([^&]+)/i);
             return nameMatch ? decodeURIComponent(nameMatch[1].replace(/\+/g, ' '))
-                 : `Torrent-${getMagnetHash(magnetUrl)?.substring(0, 8) || 'Unknown'}`;
-        } catch {
-            return 'Unknown Magnet';
-        }
+                : `Torrent-${getMagnetHash(magnetUrl)?.substring(0, 8) || 'Unknown'}`;
+        } catch { return 'Unknown Magnet'; }
     }
 
     GM_addStyle(`
-        .rd-magnet-button {
-            display: inline-block;
-            margin-left: 8px;
-            padding: 4px 10px;
-            background: #2ecc71;
-            color: white;
-            border-radius: 4px;
-            font: bold 12px sans-serif;
-            cursor: pointer;
-            border: none;
-            transition: all 0.3s ease;
-        }
-        .rd-magnet-button:disabled {
-            cursor: not-allowed;
-            opacity: 0.7;
-        }
+        .rd-magnet-button { display: inline-block; margin-left: 8px; padding: 4px 10px; background: #2ecc71; color: white; border-radius: 4px;
+            font: bold 12px sans-serif; cursor: pointer; border: none; transition: all 0.3s ease; }
+        .rd-magnet-button:disabled { cursor: not-allowed; opacity: 0.7; }
         .rd-magnet-button:hover:not(:disabled) { opacity: 0.85; }
-        #rd-task-manager {
-            position: fixed;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            width: 90%;
-            max-width: 600px;
-            max-height: 80vh;
-            background: white;
-            border-radius: 8px;
-            box-shadow: 0 5px 30px rgba(0,0,0,0.3);
-            z-index: 999999;
-            display: none;
-            font-family: sans-serif;
-        }
+        #rd-task-manager { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 600px; max-height: 80vh;
+            background: white; border-radius: 8px; box-shadow: 0 5px 30px rgba(0,0,0,0.3); z-index: 999999; display: none; font-family: sans-serif; }
         #rd-task-manager.active { display: block; }
-        .rd-task-manager-header {
-            padding: 15px;
-            background: #3498db;
-            color: white;
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-        }
-        .rd-task-manager-close {
-            background: none;
-            border: none;
-            color: white;
-            font-size: 20px;
-            cursor: pointer;
-            position: absolute;
-            top: 10px;
-            right: 10px;
-        }
-        .rd-task-list {
-            padding: 15px;
-            max-height: 60vh;
-            overflow-y: auto;
-        }
-        .rd-task-item {
-            padding: 10px;
-            margin: 5px 0;
-            background: #f8f9fa;
-            border-radius: 4px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-        }
-        .rd-task-info {
-            flex: 1;
-            overflow: hidden;
-            margin-right: 10px;
-        }
-        .rd-task-name {
-            font-weight: bold;
-            margin-bottom: 3px;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-        .rd-task-progress {
-            height: 4px;
-            background: #ddd;
-            border-radius: 2px;
-            margin: 5px 0;
-            overflow: hidden;
-        }
-        .rd-task-progress-bar {
-            height: 100%;
-            background: #2ecc71;
-            transition: width 0.3s ease;
-        }
-        .rd-task-status {
-            padding: 2px 8px;
-            border-radius: 3px;
-            font-size: 12px;
-            min-width: 70px;
-            text-align: center;
-        }
+        .rd-task-manager-header { padding: 15px; background: #3498db; color: white; display: flex; flex-direction: column; gap: 10px; }
+        .rd-task-manager-close { background: none; border: none; color: white; font-size: 20px; cursor: pointer; position: absolute;
+            top: 10px; right: 10px; }
+        .rd-task-list { padding: 15px; max-height: 60vh; overflow-y: auto; }
+        .rd-task-item { padding: 10px; margin: 5px 0; background: #f8f9fa; border-radius: 4px; display: flex; align-items: center;
+            justify-content: space-between; }
+        .rd-task-info { flex: 1; overflow: hidden; margin-right: 10px; }
+        .rd-task-name { font-weight: bold; margin-bottom: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .rd-task-progress { height: 4px; background: #ddd; border-radius: 2px; margin: 5px 0; overflow: hidden; }
+        .rd-task-progress-bar { height: 100%; background: #2ecc71; transition: width 0.3s ease; }
+        .rd-task-status { padding: 2px 8px; border-radius: 3px; font-size: 12px; min-width: 70px; text-align: center; }
         .rd-task-pending { background: #f39c12; }
         .rd-task-processing { background: #3498db; }
         .rd-task-downloading { background: #2980b9; }
@@ -216,94 +165,26 @@
         .rd-task-completed { background: #2ecc71; }
         .rd-task-failed { background: #e74c3c; }
         .rd-task-done { background: #95a5a6; }
-        .rd-task-actions {
-            display: flex;
-            gap: 5px;
-        }
-        .rd-task-button {
-            padding: 3px 8px;
-            border: none;
-            border-radius: 3px;
-            cursor: pointer;
-            font-size: 12px;
-        }
-        .rd-task-retry {
-            background: #3498db !important;
-            color: white !important;
-        }
-        .rd-task-delete-rd {
-            background: #95a5a6 !important;
-            color: white !important;
-        }
-        #rd-task-manager-toggle {
-            position: fixed;
-            bottom: 20px;
-            right: 20px;
-            width: 40px;
-            height: 40px;
-            background: #3498db;
-            color: white;
-            border-radius: 50%;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            cursor: pointer;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
-            z-index: 99999;
-        }
-        .rd-filter-controls {
-            display: flex;
-            gap: 8px;
-            align-items: center;
-            margin-top: 10px;
-        }
-        .rd-filter-btn {
-            padding: 4px 8px;
-            border: 1px solid #3498db;
-            border-radius: 4px;
-            background: white;
-            color: #3498db;
-            cursor: pointer;
-            font-size: 12px;
-        }
-        .rd-filter-btn.active {
-            background: #3498db;
-            color: white;
-        }
-        .rd-clear-buttons {
-            display: flex;
-            gap: 8px;
-            margin-left: auto;
-        }
-        .rd-clear-history {
-            background: #f1c40f !important;
-            border-color: #f39c12 !important;
-        }
-        .rd-clear-tracking {
-            background: #e74c3c !important;
-            border-color: #c0392b !important;
-        }
-        .rd-export-import {
-            background: #2ecc71 !important;
-            border-color: #27ae60 !important;
-            color: white !important;
-        }
+        .rd-task-actions { display: flex; gap: 5px; }
+        .rd-task-button { padding: 3px 8px; border: none; border-radius: 3px; cursor: pointer; font-size: 12px; }
+        .rd-task-retry { background: #3498db !important; color: white !important; }
+        .rd-task-delete-rd { background: #95a5a6 !important; color: white !important; }
+        #rd-task-manager-toggle { position: fixed; bottom: 20px; right: 20px; width: 40px; height: 40px; background: #3498db; color: white;
+            border-radius: 50%; display: flex; justify-content: center; align-items: center; cursor: pointer; box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+            z-index: 99999; }
+        .rd-filter-controls { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+        .rd-filter-btn { padding: 4px 8px; border: 1px solid #3498db; border-radius: 4px; background: white; color: #3498db; cursor: pointer;
+            font-size: 12px; }
+        .rd-filter-btn.active { background: #3498db; color: white; }
+        .rd-clear-buttons { display: flex; gap: 8px; margin-left: auto; }
+        .rd-clear-history { background: #f1c40f !important; border-color: #f39c12 !important; }
+        .rd-clear-tracking { background: #e74c3c !important; border-color: #c0392b !important; }
+        .rd-export-import { background: #2ecc71 !important; border-color: #27ae60 !important; color: white !important; }
         .rd-clear-history:hover { background: #f39c12 !important; }
         .rd-clear-tracking:hover { background: #c0392b !important; }
         .rd-export-import:hover { background: #27ae60 !important; }
-        #rd-status-message {
-            position: fixed;
-            bottom: 20px;
-            left: 20px;
-            padding: 10px 15px;
-            background: #3498db;
-            color: white;
-            border-radius: 5px;
-            z-index: 99999;
-            font-family: sans-serif;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
-            max-width: 80vw;
-        }
+        #rd-status-message { position: fixed; bottom: 20px; left: 20px; padding: 10px 15px; background: #3498db; color: white; border-radius: 5px;
+            z-index: 99999; font-family: sans-serif; box-shadow: 0 2px 10px rgba(0,0,0,0.2); max-width: 80vw; }
     `);
 
     function createTaskManager() {
@@ -312,7 +193,7 @@
             manager.id = 'rd-task-manager';
             manager.innerHTML = `
                 <div class="rd-task-manager-header">
-                    <h3>Real-Debrid Tasks (${config.instanceName})</h3>
+                    <h3>Real-Debrid Tasks (${CONFIG.instanceName})</h3>
                     <div class="rd-filter-controls">
                         <button class="rd-filter-btn active" data-filter="all">All</button>
                         <button class="rd-filter-btn" data-filter="active">Active</button>
@@ -329,11 +210,7 @@
                 <div class="rd-task-list"></div>
             `;
             uw.document.body.appendChild(manager);
-
-            manager.querySelector('.rd-task-manager-close').addEventListener('click', () => {
-                manager.classList.remove('active');
-            });
-
+            manager.querySelector('.rd-task-manager-close').addEventListener('click', () => manager.classList.remove('active'));
             manager.querySelectorAll('.rd-filter-btn').forEach(btn => {
                 btn.addEventListener('click', () => {
                     manager.querySelectorAll('.rd-filter-btn').forEach(b => b.classList.remove('active'));
@@ -343,7 +220,6 @@
                     updateTaskManager();
                 });
             });
-
             manager.querySelector('.rd-clear-history').addEventListener('click', () => {
                 if (confirm('Clear history but keep tracking?')) {
                     tasks = tasks.filter(t => !['completed', 'failed', 'done'].includes(t.status));
@@ -352,7 +228,6 @@
                     showStatus("History cleared", '#2ecc71', 3000);
                 }
             });
-
             manager.querySelector('.rd-clear-tracking').addEventListener('click', () => {
                 if (confirm('Clear ALL history and tracking?')) {
                     tasks = [];
@@ -370,7 +245,6 @@
                     showStatus("Full reset complete", '#e74c3c', 3000);
                 }
             });
-
             manager.querySelector('.rd-export-import').addEventListener('click', handleExportImport);
         }
     }
@@ -394,9 +268,7 @@
                         GM_setValue(storageKeys.activeTasks, JSON.stringify(activeTasks));
                         updateTaskManager();
                         showStatus('Data imported!', '#2ecc71', 3000);
-                    } catch {
-                        showStatus('Invalid backup file', '#e74c3c', 5000);
-                    }
+                    } catch { showStatus('Invalid backup file', '#e74c3c', 5000); }
                 };
                 reader.readAsText(file);
             };
@@ -434,30 +306,15 @@
     function updateTaskManager() {
         const manager = uw.document.getElementById('rd-task-manager');
         if (!manager) return;
-
         const list = manager.querySelector('.rd-task-list');
         list.innerHTML = '';
-
         let filteredTasks = [...Object.values(activeTasks), ...tasks];
-
         switch(currentFilter) {
-            case 'active':
-                filteredTasks = filteredTasks.filter(t =>
-                    ['pending', 'processing', 'downloading', 'symlinking'].includes(t.status)
-                );
-                break;
-            case 'symlinking':
-                filteredTasks = filteredTasks.filter(t => t.status === 'symlinking');
-                break;
-            case 'completed':
-                filteredTasks = filteredTasks.filter(t => ['completed', 'done'].includes(t.status));
-                break;
+            case 'active': filteredTasks = filteredTasks.filter(t => ['pending', 'processing', 'downloading', 'symlinking'].includes(t.status)); break;
+            case 'symlinking': filteredTasks = filteredTasks.filter(t => t.status === 'symlinking'); break;
+            case 'completed': filteredTasks = filteredTasks.filter(t => ['completed', 'done'].includes(t.status)); break;
         }
-
-        filteredTasks = filteredTasks
-            .sort((a, b) => b.timestamp - a.timestamp)
-            .slice(0, currentFilter === 'all' ? config.maxHistoryItems : 100);
-
+        filteredTasks = filteredTasks.sort((a, b) => b.timestamp - a.timestamp).slice(0, currentFilter === 'all' ? CONFIG.maxHistoryItems : 100);
         filteredTasks.forEach(task => {
             const taskEl = uw.document.createElement('div');
             taskEl.className = 'rd-task-item';
@@ -466,9 +323,7 @@
             taskEl.innerHTML = `
                 <div class="rd-task-info">
                     <div class="rd-task-name" title="${displayName}">${displayName.substring(0, 50)}</div>
-                    <div class="rd-task-progress">
-                        <div class="rd-task-progress-bar" style="width: ${task.progress}%"></div>
-                    </div>
+                    <div class="rd-task-progress"><div class="rd-task-progress-bar" style="width: ${task.progress}%"></div></div>
                     <div class="rd-task-status-text">${task.statusText || ''}</div>
                 </div>
                 <div class="rd-task-status ${statusClass}">${task.status.charAt(0).toUpperCase() + task.status.slice(1)}</div>
@@ -480,18 +335,9 @@
             `;
             list.appendChild(taskEl);
         });
-
-        list.querySelectorAll('.rd-task-retry').forEach(btn => {
-            btn.addEventListener('click', () => retryTask(btn.dataset.id));
-        });
-
-        list.querySelectorAll('.rd-task-remove, .rd-task-delete-rd').forEach(btn => {
-            btn.addEventListener('click', () => removeTask(btn.dataset.id));
-        });
-
-        if (filteredTasks.length === 0) {
-            list.innerHTML = '<div style="text-align: center; padding: 20px; color: #666;">No tasks found</div>';
-        }
+        list.querySelectorAll('.rd-task-retry').forEach(btn => btn.addEventListener('click', () => retryTask(btn.dataset.id)));
+        list.querySelectorAll('.rd-task-remove, .rd-task-delete-rd').forEach(btn => btn.addEventListener('click', () => removeTask(btn.dataset.id)));
+        if (filteredTasks.length === 0) list.innerHTML = '<div style="text-align: center; padding: 20px; color: #666;">No tasks found</div>';
     }
 
     function retryTask(taskId) {
@@ -519,10 +365,9 @@
         if (activeTasks[taskId]) {
             const task = activeTasks[taskId];
             if (task.rdTorrentId && event.target.classList.contains('rd-task-delete-rd')) {
-                rdAPI(`/torrents/delete/${task.rdTorrentId}`, 'DELETE')
-                    .catch(error => showStatus(`RD Delete Failed: ${error}`, '#e74c3c', 5000));
+                rdProxy(`/torrents/delete/${task.rdTorrentId}`, 'DELETE')
+                    .catch(() => showStatus(`RD Delete Failed`, '#e74c3c', 5000));
             }
-
             task.status = 'cancelled';
             task.statusText = 'Cancelled by user';
             tasks.push(task);
@@ -538,19 +383,12 @@
     async function startProcessing(magnetUrl, button, mode, taskId = null) {
         const hash = getMagnetHash(magnetUrl);
         if (!taskId) taskId = addTask(magnetUrl, mode, button?.closest('tr')?.querySelector('td')?.textContent?.trim() || '');
-
         try {
             let task = activeTasks[taskId];
             let rdTorrentId = task?.rdTorrentId;
             let torrentInfo = task?.torrentInfo;
             let videoFiles = task?.videoFiles;
-
-            const existingCompleted = [...tasks, ...Object.values(activeTasks)].find(t =>
-                t.hash === hash &&
-                ['completed', 'done'].includes(t.status) &&
-                t.mode === mode
-            );
-
+            const existingCompleted = [...tasks, ...Object.values(activeTasks)].find(t => t.hash === hash && ['completed', 'done'].includes(t.status) && t.mode === mode);
             if (existingCompleted) {
                 if (mode === 'symlink' && existingCompleted.result?.path) {
                     GM_setClipboard(existingCompleted.result.path);
@@ -560,66 +398,37 @@
                 }
                 throw new Error('This magnet has already been processed');
             }
-
             if (!rdTorrentId) {
-                updateTask(taskId, {
-                    status: 'processing',
-                    statusText: 'Adding magnet...',
-                    progress: 0
-                });
-
-                const { id } = await rdAPI('/torrents/addMagnet', 'POST', `magnet=${encodeURIComponent(magnetUrl)}`);
+                updateTask(taskId, { status: 'processing', statusText: 'Adding magnet...', progress: 0 });
+                const { id } = await rdProxy('/torrents/addMagnet', 'POST', `magnet=${encodeURIComponent(magnetUrl)}`);
                 rdTorrentId = id;
-                updateTask(taskId, {
-                    rdTorrentId,
-                    status: 'processing',
-                    statusText: 'Analyzing files...',
-                    progress: 10
-                });
+                updateTask(taskId, { rdTorrentId, status: 'processing', statusText: 'Analyzing files...', progress: 10 });
             }
-
             if (!torrentInfo || !videoFiles) {
                 while (activeTasks[taskId]) {
-                    torrentInfo = await rdAPI(`/torrents/info/${rdTorrentId}`);
+                    torrentInfo = await rdProxy(`/torrents/info/${rdTorrentId}`);
                     updateTask(taskId, { torrentInfo });
-
-                    updateTask(taskId, {
-                        status: 'processing',
-                        statusText: `Processing files (${torrentInfo.status})`,
-                        progress: Math.min(30, task.progress + 2)
-                    });
-
+                    updateTask(taskId, { status: 'processing', statusText: `Processing files (${torrentInfo.status})`, progress: Math.min(30, task.progress + 2) });
                     if (torrentInfo.status === 'waiting_files_selection') break;
                     await new Promise(r => setTimeout(r, 3000));
                 }
-
                 videoFiles = torrentInfo.files.filter(f => {
                     const path = f.path || '';
                     const fileName = path.split(/[\\/]/).pop() || '';
                     const ext = fileName.split('.').pop()?.toLowerCase() || '';
-                    return config.videoExtensions.has(ext) &&
-                           f.bytes >= config.minFileSize &&
-                           !fileName.toLowerCase().includes('sample');
+                    return CONFIG.videoExtensions.has(ext) && f.bytes >= CONFIG.minFileSize && !fileName.toLowerCase().includes('sample');
                 }).sort((a, b) => b.bytes - a.bytes);
-
                 if (videoFiles.length === 0) throw new Error("No supported video files found");
                 updateTask(taskId, { videoFiles });
-
                 if (!torrentInfo.files_selected) {
-                    await rdAPI(`/torrents/selectFiles/${rdTorrentId}`, 'POST', `files=${videoFiles.map(f => f.id).join(',')}`);
-                    updateTask(taskId, {
-                        status: 'downloading',
-                        statusText: 'Starting download...',
-                        progress: 35
-                    });
+                    await rdProxy(`/torrents/selectFiles/${rdTorrentId}`, 'POST', `files=${videoFiles.map(f => f.id).join(',')}`);
+                    updateTask(taskId, { status: 'downloading', statusText: 'Starting download...', progress: 35 });
                 }
             }
-
             let lastProgress = task?.progress || 0;
             while (activeTasks[taskId]) {
-                const downloadStatus = await rdAPI(`/torrents/info/${rdTorrentId}`);
+                const downloadStatus = await rdProxy(`/torrents/info/${rdTorrentId}`);
                 updateTask(taskId, { downloadStatus });
-
                 const currentProgress = Math.round(downloadStatus.progress);
                 if (currentProgress !== lastProgress) {
                     updateTask(taskId, {
@@ -629,45 +438,25 @@
                     });
                     lastProgress = currentProgress;
                 }
-
                 if (['downloaded', 'seeding'].includes(downloadStatus.status)) break;
                 if (['error', 'virus'].includes(downloadStatus.status)) throw new Error(downloadStatus.status);
-
                 await new Promise(r => setTimeout(r, 3000));
             }
-
             if (mode === 'symlink') {
                 if (task.result?.path) {
                     GM_setClipboard(task.result.path);
                     completeTask(taskId, true, task.result);
                     return;
                 }
-
-                updateTask(taskId, {
-                    status: 'symlinking',
-                    progress: 95,
-                    statusText: 'Finalizing symlink...'
-                });
-
+                updateTask(taskId, { status: 'symlinking', progress: 95, statusText: 'Finalizing symlink...' });
                 const fullPath = videoFiles[0].path || '';
                 const fileName = fullPath.split(/[\\/]/).pop();
                 const [baseName] = fileName.match(/(.*?)(\.[^.]*)?$/) || [fileName];
-                const cleanDirName = baseName
-                    .replace(/[<>:"/\\|?*]/g, '_')
-                    .substring(0, 200);
-
+                const cleanDirName = baseName.replace(/[<>:"/\\|?*]/g, '_').substring(0, 200);
                 try {
-                    const symlinkResult = await backendAPI('/symlink', {
-                        hash,
-                        filename: cleanDirName,
-                        torrent_id: rdTorrentId
-                    });
-
-                    const symlinkPath = symlinkResult.path ||
-                                      `${symlinkResult.directory}/${fileName}`;
-
+                    const symlinkResult = await backendAPI('/symlink', { hash, filename: cleanDirName, torrent_id: rdTorrentId });
+                    const symlinkPath = symlinkResult.path || `${symlinkResult.directory}/${fileName}`;
                     if (!symlinkPath) throw new Error('Symlink path not received');
-
                     GM_setClipboard(symlinkPath);
                     completeTask(taskId, true, { path: symlinkPath });
                     showStatus('Symlink ready! Copied to clipboard.', '#2ecc71', 3000);
@@ -676,21 +465,18 @@
                         GM_setClipboard(error.path);
                         completeTask(taskId, true, { path: error.path });
                         showStatus('Symlink already exists! Copied to clipboard.', '#2ecc71', 3000);
-                    } else {
-                        throw error;
-                    }
+                    } else throw error;
                 }
-            } else {
-                completeTask(taskId, true);
-            }
-        } catch (error) {
-            completeTask(taskId, false, { error: error.message });
-            if (button) {
-                button.textContent = '✗ Failed';
-                button.style.background = '#e74c3c';
-            }
-            showStatus(`Failed: ${error.message}`, '#e74c3c', 5000);
-        }
+            } else completeTask(taskId, true);
+} catch (error) {
+    const message = error.message.replace('Real-Debrid Error: ', '');
+    completeTask(taskId, false, { error: message });
+    if (button) {
+        button.textContent = '✗ Failed';
+        button.style.background = '#e74c3c';
+    }
+    showStatus(`Failed: ${message}`, '#e74c3c', 5000);
+}
     }
 
     function formatSpeed(bytesPerSecond) {
@@ -698,10 +484,7 @@
         const speeds = ['B/s', 'KB/s', 'MB/s'];
         let speed = bytesPerSecond;
         let unitIndex = 0;
-        while (speed >= 1024 && unitIndex < speeds.length - 1) {
-            speed /= 1024;
-            unitIndex++;
-        }
+        while (speed >= 1024 && unitIndex < speeds.length - 1) { speed /= 1024; unitIndex++; }
         return `${speed.toFixed(unitIndex === 0 ? 0 : 1)} ${speeds[unitIndex]}`;
     }
 
@@ -709,21 +492,8 @@
         const hash = getMagnetHash(magnet);
         const existing = Object.values(activeTasks).find(t => t.hash === hash && t.mode === mode);
         if (existing) return existing.id;
-
         const taskId = `task_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-        activeTasks[taskId] = {
-            id: taskId,
-            hash,
-            magnet,
-            name: getMagnetName(magnet),
-            mode,
-            filename,
-            status: 'pending',
-            progress: 0,
-            timestamp: Date.now(),
-            retries: 0
-        };
-
+        activeTasks[taskId] = { id: taskId, hash, magnet, name: getMagnetName(magnet), mode, filename, status: 'pending', progress: 0, timestamp: Date.now(), retries: 0 };
         clickedHashes[hash] = true;
         GM_setValue(storageKeys.clickedHashes, JSON.stringify(clickedHashes));
         saveActiveTasks();
@@ -747,7 +517,6 @@
             task.timestamp = Date.now();
             task.statusText = success ? 'Completed successfully' : 'Failed';
             if (result) task.result = result;
-
             tasks.push(task);
             delete activeTasks[taskId];
             saveActiveTasks();
@@ -765,10 +534,8 @@
         uw.document.querySelectorAll('.rd-magnet-button').forEach(btn => {
             const magnet = btn.getAttribute('data-magnet');
             if (!magnet) return;
-
             const hash = getMagnetHash(magnet);
             const task = [...Object.values(activeTasks), ...tasks].find(t => t.hash === hash);
-
             if (task) {
                 btn.textContent = {
                     pending: '⏳ Pending',
@@ -780,7 +547,6 @@
                     failed: '✗ Failed',
                     cancelled: '✗ Cancelled'
                 }[task.status] || 'RD';
-
                 btn.style.background = {
                     pending: '#f39c12',
                     processing: '#3498db',
@@ -791,7 +557,6 @@
                     failed: '#e74c3c',
                     cancelled: '#e74c3c'
                 }[task.status] || '#2ecc71';
-
                 btn.disabled = ['completed', 'done', 'failed', 'cancelled'].includes(task.status);
             } else {
                 btn.textContent = clickedHashes[hash] ? '✓ Processed' : 'RD';
@@ -804,25 +569,9 @@
     function markAsDone(magnetUrl) {
         const hash = getMagnetHash(magnetUrl);
         if (!hash) return;
-
         const existingTask = tasks.find(t => t.hash === hash) || Object.values(activeTasks).find(t => t.hash === hash);
-
-        if (existingTask) {
-            existingTask.status = 'done';
-            existingTask.progress = 100;
-        } else {
-            tasks.push({
-                id: `done_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-                hash,
-                magnet: magnetUrl,
-                name: getMagnetName(magnetUrl),
-                status: 'done',
-                progress: 100,
-                timestamp: Date.now(),
-                retries: 0
-            });
-        }
-
+        if (existingTask) { existingTask.status = 'done'; existingTask.progress = 100; }
+        else tasks.push({ id: `done_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`, hash, magnet: magnetUrl, name: getMagnetName(magnetUrl), status: 'done', progress: 100, timestamp: Date.now(), retries: 0 });
         clickedHashes[hash] = true;
         GM_setValue(storageKeys.clickedHashes, JSON.stringify(clickedHashes));
         saveActiveTasks();
@@ -834,7 +583,6 @@
         createTaskManager();
         createTaskManagerToggle();
         updateTaskManager();
-
         const processMagnetLinks = () => {
             uw.document.querySelectorAll('a[href^="magnet:"]').forEach(link => {
                 if (!link.nextElementSibling?.classList?.contains('rd-magnet-button')) {
@@ -847,24 +595,13 @@
             });
             debouncedUpdateButtonStates();
         };
-
-        // Initial processing
         processMagnetLinks();
-
-        // MutationObserver setup
         const observer = new uw.MutationObserver(mutations => {
             mutations.forEach(mutation => {
-                if (mutation.addedNodes.length) {
-                    processMagnetLinks();
-                }
+                if (mutation.addedNodes.length) processMagnetLinks();
             });
         });
-
-        observer.observe(uw.document.body, {
-            childList: true,
-            subtree: true
-        });
-
+        observer.observe(uw.document.body, { childList: true, subtree: true });
         checkBackendHealth().catch(() => {});
     }
 
@@ -872,70 +609,35 @@
         const button = e.currentTarget;
         const magnetLink = button.getAttribute('data-magnet');
         if (!magnetLink) return;
-
         const hash = getMagnetHash(magnetLink);
         const existingTask = tasks.find(t => t.hash === hash && ['completed', 'done'].includes(t.status));
-        if (existingTask) {
-            showStatus('Already available!', '#2ecc71', 3000);
-            return;
-        }
-
+        if (existingTask) { showStatus('Already available!', '#2ecc71', 3000); return; }
         const menu = uw.document.createElement('div');
-        menu.style.cssText = `
-            position: absolute;
-            background: white;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
-            z-index: 99999;
-        `;
-
+        menu.style.cssText = `position: absolute; background: white; border: 1px solid #ddd; border-radius: 4px; box-shadow: 0 2px 10px rgba(0,0,0,0.2); z-index: 99999;`;
         ['Cache Only', 'Cache + Symlink', 'Mark as Done'].forEach((text, index) => {
             const item = uw.document.createElement('div');
             item.textContent = text;
-            item.style.cssText = `
-                padding: 8px 12px;
-                cursor: pointer;
-                background: ${index === 2 ? '#f8f9fa' : 'white'};
-                border-bottom: ${index < 2 ? '1px solid #eee' : 'none'};
-                white-space: nowrap;
-            `;
+            item.style.cssText = `padding: 8px 12px; cursor: pointer; background: ${index === 2 ? '#f8f9fa' : 'white'}; border-bottom: ${index < 2 ? '1px solid #eee' : 'none'}; white-space: nowrap;`;
             item.onmouseenter = () => item.style.background = '#f0f0f0';
             item.onmouseleave = () => item.style.background = index === 2 ? '#f8f9fa' : 'white';
-            item.onclick = () => {
-                menu.remove();
-                handleMenuChoice(index, magnetLink, button);
-            };
+            item.onclick = () => { menu.remove(); handleMenuChoice(index, magnetLink, button); };
             menu.appendChild(item);
         });
-
         const rect = button.getBoundingClientRect();
         menu.style.top = `${rect.bottom + uw.scrollY}px`;
         menu.style.left = `${rect.left + uw.scrollX}px`;
         uw.document.body.appendChild(menu);
-
         const closeMenu = (e) => {
-            if (!menu.contains(e.target) && e.target !== button) {
-                menu.remove();
-                uw.document.removeEventListener('click', closeMenu);
-            }
+            if (!menu.contains(e.target) && e.target !== button) { menu.remove(); uw.document.removeEventListener('click', closeMenu); }
         };
         setTimeout(() => uw.document.addEventListener('click', closeMenu), 0);
     }
 
     function handleMenuChoice(index, magnetLink, button) {
         switch(index) {
-            case 0:
-                addTask(magnetLink, 'cache');
-                startProcessing(magnetLink, button, 'cache');
-                break;
-            case 1:
-                addTask(magnetLink, 'symlink');
-                startProcessing(magnetLink, button, 'symlink');
-                break;
-            case 2:
-                markAsDone(magnetLink);
-                break;
+            case 0: addTask(magnetLink, 'cache'); startProcessing(magnetLink, button, 'cache'); break;
+            case 1: addTask(magnetLink, 'symlink'); startProcessing(magnetLink, button, 'symlink'); break;
+            case 2: markAsDone(magnetLink); break;
         }
         debouncedUpdateButtonStates();
     }
@@ -943,64 +645,20 @@
     function showStatus(message, color = '#3498db', timeout = 0) {
         const existing = uw.document.getElementById('rd-status-message');
         if (existing) existing.remove();
-
         const msg = uw.document.createElement('div');
         msg.id = 'rd-status-message';
         msg.textContent = message;
-        msg.style.cssText = `
-            position: fixed;
-            bottom: 20px;
-            left: 20px;
-            padding: 10px 15px;
-            background: ${color};
-            color: white;
-            border-radius: 5px;
-            z-index: 99999;
-            font-family: sans-serif;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
-            max-width: 80vw;
-        `;
-
+        msg.style.cssText = `position: fixed; bottom: 20px; left: 20px; padding: 10px 15px; background: ${color}; color: white; border-radius: 5px; z-index: 99999; font-family: sans-serif; box-shadow: 0 2px 10px rgba(0,0,0,0.2); max-width: 80vw;`;
         uw.document.body.appendChild(msg);
         if (timeout > 0) setTimeout(() => msg.remove(), timeout);
     }
 
-    async function rdAPI(endpoint, method = 'GET', data = null, retries = config.maxRetries) {
-        try {
-            return await new Promise((resolve, reject) => {
-                GM_xmlhttpRequest({
-                    method: method,
-                    url: `https://api.real-debrid.com/rest/1.0${endpoint}`,
-                    headers: {
-                        'Authorization': `Bearer ${config.rdApiKey}`,
-                        'Content-Type': 'application/x-www-form-urlencoded'
-                    },
-                    data: data,
-                    timeout: 15000,
-                    onload: (res) => {
-                        try {
-                            const response = res.responseText ? JSON.parse(res.responseText) : {};
-                            res.status >= 200 && res.status < 300 ? resolve(response) : reject(response.error || `HTTP ${res.status}`);
-                        } catch (e) { reject(`Parse error: ${e.message}`); }
-                    },
-                    onerror: (err) => reject(err.statusText || 'Connection failed')
-                });
-            });
-        } catch (error) {
-            if (retries > 0) {
-                await new Promise(r => setTimeout(r, config.retryDelay));
-                return rdAPI(endpoint, method, data, retries - 1);
-            }
-            throw error;
-        }
-    }
-
-    async function backendAPI(endpoint, data = {}, retries = config.maxRetries) {
+    async function backendAPI(endpoint, data = {}, retries = CONFIG.maxRetries) {
         try {
             return await new Promise((resolve, reject) => {
                 GM_xmlhttpRequest({
                     method: 'POST',
-                    url: `${config.backendUrl}${endpoint}`,
+                    url: `${CONFIG.backendUrl}${endpoint}`,
                     headers: { 'Content-Type': 'application/json' },
                     data: JSON.stringify(data),
                     timeout: 20000,
@@ -1009,17 +667,10 @@
                             const response = JSON.parse(res.responseText);
                             if (res.status === 200) {
                                 if (response.error) {
-                                    if (response.error.includes('Symlink already exists')) {
-                                        resolve({ path: response.path || response.directory });
-                                    } else {
-                                        reject(response.error);
-                                    }
-                                } else {
-                                    resolve(response);
-                                }
-                            } else {
-                                reject(response.error || res.statusText);
-                            }
+                                    if (response.error.includes('Symlink already exists')) resolve({ path: response.path || response.directory });
+                                    else reject(response.error);
+                                } else resolve(response);
+                            } else reject(response.error || res.statusText);
                         } catch { reject(`Invalid JSON: ${res.responseText.slice(0, 100)}`); }
                     },
                     onerror: (err) => reject(err.statusText || 'Backend connection failed')
@@ -1027,15 +678,12 @@
             });
         } catch (error) {
             if (retries > 0) {
-                await new Promise(r => setTimeout(r, config.retryDelay));
+                await new Promise(r => setTimeout(r, CONFIG.retryDelay));
                 return backendAPI(endpoint, data, retries - 1);
             }
-
-            if (typeof error === 'string') {
-                if (error.includes('Symlink already exists')) {
-                    const pathMatch = error.match(/at (.+)/);
-                    if (pathMatch) return { path: pathMatch[1] };
-                }
+            if (typeof error === 'string' && error.includes('Symlink already exists')) {
+                const pathMatch = error.match(/at (.+)/);
+                if (pathMatch) return { path: pathMatch[1] };
             }
             throw error;
         }
@@ -1046,16 +694,14 @@
             await new Promise((resolve, reject) => {
                 GM_xmlhttpRequest({
                     method: 'GET',
-                    url: `${config.backendUrl}/health`,
+                    url: `${CONFIG.backendUrl}/health`,
                     timeout: 5000,
                     onload: (res) => res.status === 200 ? resolve() : reject(),
                     onerror: reject
                 });
             });
             return true;
-        } catch {
-            return false;
-        }
+        } catch { return false; }
     }
 
     if (uw.document.readyState === 'loading') {

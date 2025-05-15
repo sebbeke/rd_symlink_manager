@@ -1,4 +1,8 @@
+from werkzeug.middleware.proxy_fix import ProxyFix
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import os
+import json
 import logging
 import sys
 import urllib.parse
@@ -8,100 +12,50 @@ import time
 import threading
 import uuid
 import shutil
-from collections import deque
-from flask import Flask, request, jsonify
 from pathlib import Path
+from collections import deque
+
+logging.basicConfig(
+    format='%(asctime)s %(levelname)s [%(module)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    level=logging.INFO
+)
 
 app = Flask(__name__)
-
-# ======================
-# ENVIRONMENT CONFIG
-# ======================
-RD_API_KEY = os.getenv("RD_API_KEY")
-MEDIA_SERVER = os.getenv("MEDIA_SERVER", "plex").lower()
-ENABLE_DOWNLOADS = os.getenv("ENABLE_DOWNLOADS", "false").lower() == "true"
-MOVE_TO_FINAL_LIBRARY = os.getenv("MOVE_TO_FINAL_LIBRARY", "true").lower() == "true"
-
-# Path configuration
-SYMLINK_BASE_PATH = Path(os.getenv("SYMLINK_BASE_PATH", "/symlinks"))
-DOWNLOAD_COMPLETE_PATH = Path(os.getenv("DOWNLOAD_COMPLETE_PATH", "/dl_complete"))
-FINAL_LIBRARY_PATH = Path(os.getenv("FINAL_LIBRARY_PATH", "/library"))
-RCLONE_MOUNT_PATH = Path(os.getenv("RCLONE_MOUNT_PATH", "/mnt/data/media/remote/realdebrid/__all__"))
-
-# Media server config
-PLEX_TOKEN = os.getenv("PLEX_TOKEN")
-PLEX_LIBRARY_NAME = os.getenv("PLEX_LIBRARY_NAME")
-PLEX_SERVER_IP = os.getenv("PLEX_SERVER_IP")
-EMBY_SERVER_IP = os.getenv("EMBY_SERVER_IP")
-EMBY_API_KEY = os.getenv("EMBY_API_KEY")
-EMBY_LIBRARY_NAME = os.getenv("EMBY_LIBRARY_NAME")  # New variable
-
-# Advanced
-MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "3"))
-DELETE_AFTER_COPY = os.getenv("DELETE_AFTER_COPY", "false").lower() == "true"
-REMOVE_WORDS = [w.strip() for w in os.getenv("REMOVE_WORDS", "").split(",") if w.strip()]
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-LOG_FILE = os.getenv("SYMLINK_LOG_FILE", "symlink_backend.log")
-SCAN_DELAY = int(os.getenv("SCAN_DELAY", "60"))
-
-# ======================
-# GLOBAL STATE
-# ======================
-plex_section_id = None
-plex_initialized = False
-task_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_TASKS)
-download_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_TASKS)
-request_queue = deque()
-queue_lock = threading.Lock()
-active_tasks = set()
-download_speeds = []
-speed_lock = threading.Lock()
-
-# ======================
-# LOGGING SETUP
-# ======================
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
+CORS(app)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 class TaskWorker(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self.running = True
-
     def run(self):
         while self.running:
             try:
-                task_id, raw_data = None, None
+                task_id, raw_data, torrent_id = None, None, None
                 with queue_lock:
                     if request_queue:
-                        task_id, raw_data = request_queue.popleft()
-
+                        task_id, raw_data, torrent_id = request_queue.popleft()
+                        active_tasks[task_id] = torrent_id
                 if raw_data:
                     with task_semaphore:
                         try:
                             start_time = time.time()
-                            with app.test_request_context(
-                                method="POST",
-                                data=raw_data,
-                                headers={"Content-Type": "application/json"}
-                            ):
+                            with app.test_request_context(method="POST", data=raw_data, headers={"Content-Type": "application/json"}):
                                 data = request.get_json()
-                                response = process_symlink_creation(data)
-
+                                response = process_symlink_creation(data, task_id)
                                 if response[1] != 200:
                                     logging.error(f"Task {task_id} failed: {response[0].get_json()}")
                         except Exception as e:
                             logging.error(f"Task {task_id} processing failed: {str(e)}")
+                            with download_lock:
+                                if task_id in download_statuses:
+                                    download_statuses[task_id]['status'] = 'failed'
+                                    download_statuses[task_id]['error'] = str(e)
                         finally:
-                            if task_id in active_tasks:
-                                active_tasks.remove(task_id)
+                            with queue_lock:
+                                if task_id in active_tasks:
+                                    del active_tasks[task_id]
                             logging.info(f"Task {task_id} completed in {time.time()-start_time:.1f}s")
                 else:
                     time.sleep(1)
@@ -109,151 +63,278 @@ class TaskWorker(threading.Thread):
                 logging.error(f"Queue worker error: {str(e)}")
                 time.sleep(5)
 
+RD_API_KEY = os.getenv("RD_API_KEY")
+MEDIA_SERVER = os.getenv("MEDIA_SERVER", "plex").lower()
+ENABLE_DOWNLOADS = os.getenv("ENABLE_DOWNLOADS", "false").lower() == "true"
+MOVE_TO_FINAL_LIBRARY = os.getenv("MOVE_TO_FINAL_LIBRARY", "true").lower() == "true"
+SYMLINK_BASE_PATH = Path(os.getenv("SYMLINK_BASE_PATH", "/symlinks"))
+DOWNLOAD_COMPLETE_PATH = Path(os.getenv("DOWNLOAD_COMPLETE_PATH", "/dl_complete"))
+FINAL_LIBRARY_PATH = Path(os.getenv("FINAL_LIBRARY_PATH", "/library"))
+RCLONE_MOUNT_PATH = Path(os.getenv("RCLONE_MOUNT_PATH", "/mnt/data/media/remote/realdebrid/__all__"))
+PLEX_TOKEN = os.getenv("PLEX_TOKEN")
+PLEX_LIBRARY_NAME = os.getenv("PLEX_LIBRARY_NAME")
+PLEX_SERVER_IP = os.getenv("PLEX_SERVER_IP")
+EMBY_SERVER_IP = os.getenv("EMBY_SERVER_IP")
+EMBY_API_KEY = os.getenv("EMBY_API_KEY")
+EMBY_LIBRARY_NAME = os.getenv("EMBY_LIBRARY_NAME")
+MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "3"))
+DELETE_AFTER_COPY = os.getenv("DELETE_AFTER_COPY", "false").lower() == "true"
+REMOVE_WORDS = [w.strip() for w in os.getenv("REMOVE_WORDS", "").split(",") if w.strip()]
+SCAN_DELAY = int(os.getenv("SCAN_DELAY", "60"))
+
+plex_section_id = None
+plex_initialized = False
+task_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_TASKS)
+queue_lock = threading.Lock()
+request_queue = deque()
+active_tasks = {}
+download_statuses = {}
+download_lock = threading.Lock()
+
+@app.route('/rd-proxy', methods=['POST'])
+def rd_proxy():
+    try:
+        data = request.get_json()
+        endpoint = data.get('endpoint', '')
+        method = data.get('method', 'GET').upper()
+        payload = data.get('data', None)
+
+        if not RD_API_KEY:
+            app.logger.error("RD_API_KEY missing in environment")
+            return jsonify({"error": "Server configuration error"}), 500
+
+        if not endpoint.startswith('/'):
+            return jsonify({"error": f"Invalid endpoint format: {endpoint}"}), 400
+
+        response = requests.request(
+            method,
+            f"https://api.real-debrid.com/rest/1.0{endpoint}",
+            headers={"Authorization": f"Bearer {RD_API_KEY}"},
+            data=payload,
+            timeout=15
+        )
+        try:
+            response.raise_for_status()
+
+            if response.status_code in [200, 202, 204] and not response.text.strip():
+                app.logger.info(f"Handled empty success response ({response.status_code})")
+                return jsonify({"status": "success"}), 200
+
+            try:
+                return jsonify(response.json()), response.status_code
+            except json.JSONDecodeError:
+                if response.status_code in [200, 202, 204]:
+                    app.logger.info(f"Empty success response ({response.status_code})")
+                    return jsonify({"status": "success"}), 200
+                app.logger.error(f"Invalid JSON response | Status: {response.status_code} | Content: {response.text[:200]}")
+                return jsonify({
+                    "source": "Real-Debrid API",
+                    "status": response.status_code,
+                    "message": response.text
+                }), response.status_code
+        except requests.HTTPError as e:
+            error_data = {
+                "source": "Real-Debrid API",
+                "status": e.response.status_code,
+                "message": e.response.text
+            }
+            return jsonify(error_data), e.response.status_code
+
+    except Exception as e:
+        error_details = {
+            "exception_type": type(e).__name__,
+            "message": str(e),
+            "request_data": data,
+            "response_content": getattr(e, 'response', {}).text if hasattr(e, 'response') else None
+        }
+        if hasattr(e, 'response') and e.response.status_code in [200, 202, 204]:
+            app.logger.info(f"Handled proxy error for success code: {json.dumps(error_details, indent=2)}")
+            return jsonify({"status": "success"}), 200
+        app.logger.error(f"Proxy Error Details:\n{json.dumps(error_details, indent=2)}")
+        return jsonify({
+            "error": "Proxy processing failed",
+            "details": str(e)
+        }), 500
+
 def get_restricted_links(torrent_id):
-    headers = {"Authorization": f"Bearer {RD_API_KEY}"}
-    response = requests.get(
-        f"https://api.real-debrid.com/rest/1.0/torrents/info/{torrent_id}",
-        headers=headers,
-        timeout=15
-    )
+    response = requests.get(f"https://api.real-debrid.com/rest/1.0/torrents/info/{torrent_id}",
+                          headers={"Authorization": f"Bearer {RD_API_KEY}"},
+                          timeout=15)
     response.raise_for_status()
     return response.json().get("links", [])
 
 def unrestrict_link(restricted_link):
-    headers = {"Authorization": f"Bearer {RD_API_KEY}"}
-    response = requests.post(
-        "https://api.real-debrid.com/rest/1.0/unrestrict/link",
-        headers=headers,
-        data={"link": restricted_link},
-        timeout=15
-    )
+    response = requests.post("https://api.real-debrid.com/rest/1.0/unrestrict/link",
+                           headers={"Authorization": f"Bearer {RD_API_KEY}"},
+                           data={"link": restricted_link},
+                           timeout=15)
     response.raise_for_status()
     return response.json()["download"]
-
-def log_total_speed():
-    while True:
-        start = time.time()
-        with speed_lock:
-            if download_speeds:
-                total = sum(download_speeds)
-                count = len(download_speeds)
-                download_speeds.clear()
-                avg_speed = total / count if count > 0 else 0
-                logging.info(
-                    f"[Aggregate] Total: {total/1024/1024:.2f} MB/s | "
-                    f"Avg: {avg_speed/1024/1024:.2f} MB/s | Active: {count}"
-                )
-
-        sleep_time = 4 - (time.time() - start)
-        if sleep_time > 0:
-            time.sleep(sleep_time)
 
 def clean_filename(original_name):
     cleaned = original_name
     for pattern in REMOVE_WORDS:
         cleaned = re.sub(rf"{re.escape(pattern)}", "", cleaned, flags=re.IGNORECASE)
-
     name_part, ext_part = os.path.splitext(cleaned)
     name_part = re.sub(r"_(\d+)(?=\.\w+$|$)", r"-cd\1", name_part)
     name_part = re.sub(r"[\W_]+", "-", name_part).strip("-")
     return f"{name_part or 'file'}"
 
-def log_download_speed(torrent_id, dest_path):
-    with download_semaphore:
-        temp_path = None
+def log_download_speed(task_id, torrent_id, dest_path):
+    temp_path = None
+    try:
+        # Initialize status entry first
+        with download_lock:
+            download_statuses[task_id] = {
+                "status": "starting",
+                "progress": 0.0,
+                "speed": 0.0,
+                "error": None,
+                "dest_path": str(dest_path),
+                "filename": Path(dest_path).name
+            }
+
+        dest_dir = dest_path.parent
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        if os.getenv('DOWNLOAD_UID') and os.getenv('DOWNLOAD_GID'):
+            os.chown(dest_dir, int(os.getenv('DOWNLOAD_UID')), int(os.getenv('DOWNLOAD_GID')))
+            os.chmod(dest_dir, 0o775)
+
+        test_file = dest_dir / "permission_test.tmp"
         try:
-            headers = {"Authorization": f"Bearer {RD_API_KEY}"}
-            response = requests.get(
-                f"https://api.real-debrid.com/rest/1.0/torrents/info/{torrent_id}",
-                headers=headers,
-                timeout=15
-            )
-            response.raise_for_status()
-            torrent_info = response.json()
-            
-            base_name = clean_filename(os.path.splitext(torrent_info["filename"])[0])
-            dest_dir = DOWNLOAD_COMPLETE_PATH / base_name
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            temp_path = dest_dir / f"{dest_path.name}.tmp"
-
-            restricted_links = get_restricted_links(torrent_id)
-            if not restricted_links:
-                raise Exception("No downloadable links found")
-
-            download_url = unrestrict_link(restricted_links[0])
-            logging.info(
-                f"Download initialized\n"
-                f"|-> Source: {download_url}\n"
-                f"|-> Temp: {temp_path}\n"
-                f"|-> Final: {dest_path}"
-            )
-
-            with requests.get(download_url, stream=True, timeout=(10, 300)) as r:
-                r.raise_for_status()
-                total_size = int(r.headers.get("content-length", 0))
-                bytes_copied = 0
-                start_time = time.time()
-                last_log = start_time
-
-                with open(temp_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=10*1024*1024):
-                        if chunk:
-                            f.write(chunk)
-                            bytes_copied += len(chunk)
-
-                            if time.time() - last_log >= 3:
-                                elapsed = time.time() - start_time
-                                speed = bytes_copied / elapsed
-                                with speed_lock:
-                                    download_speeds.append(speed)
-                                logging.info(
-                                    f"[Downloading] {dest_path.name} | "
-                                    f"Progress: {bytes_copied/total_size:.1%} | "
-                                    f"Speed: {speed/1024/1024:.2f} MB/s"
-                                )
-                                last_log = time.time()
-
-            temp_path.rename(dest_dir / dest_path.name)
-            logging.info(f"Download completed: {dest_dir / dest_path.name}")
-
-            if MOVE_TO_FINAL_LIBRARY:
-                final_path = FINAL_LIBRARY_PATH / dest_path.relative_to(DOWNLOAD_COMPLETE_PATH)
-                final_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(dest_dir / dest_path.name, final_path)
-                logging.info(f"Moved to final library: {final_path}")
-
-                try:
-                    if not any(dest_dir.iterdir()):
-                        dest_dir.rmdir()
-                        logging.info(f"Cleaned empty directory: {dest_dir}")
-                except Exception as e:
-                    logging.error(f"Directory cleanup failed: {str(e)}")
-
-                scan_path = final_path
-            else:
-                scan_path = FINAL_LIBRARY_PATH
-                logging.info(f"File retained in downloads: {dest_dir / dest_path.name}")
-
-            time.sleep(SCAN_DELAY)
-            trigger_media_scan(scan_path)
-
+            with open(test_file, "w") as f:
+                f.write("permission_test")
         except Exception as e:
-            logging.error(f"Download failed: {str(e)}")
-            if temp_path and temp_path.exists():
-                temp_path.unlink()
+            logging.warning(f"Permission test failed: {str(e)}")
+        finally:
+            if test_file.exists():
+                test_file.unlink()
+
+        torrent_info = requests.get(f"https://api.real-debrid.com/rest/1.0/torrents/info/{torrent_id}",
+                                  headers={"Authorization": f"Bearer {RD_API_KEY}"},
+                                  timeout=15).json()
+        base_name = clean_filename(os.path.splitext(torrent_info["filename"])[0])
+        dest_dir = DOWNLOAD_COMPLETE_PATH / base_name
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        final_path = dest_dir / dest_path.name
+
+        if final_path.exists():
+            logging.info(f"Skipping existing file: {final_path}")
+            with download_lock:
+                download_statuses[task_id].update({
+                    "status": "completed",
+                    "progress": 100.0,
+                    "speed": 0
+                })
+            return
+
+        temp_path = dest_dir / f"{dest_path.name}.tmp"
+        restricted_links = get_restricted_links(torrent_id)
+        if not restricted_links:
+            raise Exception("No downloadable links found")
+
+        download_url = unrestrict_link(restricted_links[0])
+        logging.info(f"Download initialized\n|-> Source: {download_url}\n|-> Temp: {temp_path}\n|-> Final: {dest_path}")
+
+        with requests.get(download_url, stream=True, timeout=(10, 300)) as r:
+            r.raise_for_status()
+            total_size = int(r.headers.get("content-length", 0))
+            bytes_copied = 0
+            start_time = time.time()
+            last_log = start_time
+
+            with open(temp_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=10*1024*1024):
+                    if chunk:
+                        f.write(chunk)
+                        bytes_copied += len(chunk)
+                        elapsed = time.time() - start_time
+                        speed = bytes_copied / elapsed if elapsed > 0 else 0
+
+                        with download_lock:
+                            download_statuses[task_id].update({
+                                "progress": bytes_copied / total_size if total_size > 0 else 0,
+                                "speed": speed,
+                                "status": "downloading"
+                            })
+
+                        if time.time() - last_log >= 3:
+                            logging.info(f"[Downloading] {dest_path.name} | Progress: {bytes_copied/total_size:.1%} | Speed: {speed/1024/1024:.2f} MB/s")
+                            last_log = time.time()
+
+                f.flush()
+                os.fsync(f.fileno())
+
+        max_retries = 3
+        retry_delay = 1
+
+        for attempt in range(max_retries):
+            try:
+                if temp_path.exists():
+                    temp_path.rename(final_path)
+                    logging.info(f"Download completed: {final_path}")
+                    break
+                elif final_path.exists():
+                    logging.warning(f"File already exists: {final_path}")
+                    break
+                else:
+                    if attempt == max_retries - 1:
+                        raise FileNotFoundError(f"Missing both temp and final files: {temp_path}")
+                    time.sleep(retry_delay)
+            except FileNotFoundError as e:
+                if attempt == max_retries - 1:
+                    raise
+                logging.warning(f"Retrying rename: {e}")
+                time.sleep(retry_delay)
+            except PermissionError as e:
+                logging.error(f"Permission denied: {str(e)}")
+                raise
+
+        if not final_path.exists():
+            raise FileNotFoundError(f"Final file missing: {final_path}")
+
+        if MOVE_TO_FINAL_LIBRARY:
+            final_lib_path = FINAL_LIBRARY_PATH / dest_path.relative_to(DOWNLOAD_COMPLETE_PATH)
+            final_lib_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(final_path, final_lib_path)
+            logging.info(f"Moved to final library: {final_lib_path}")
+            try:
+                if not any(dest_dir.iterdir()):
+                    dest_dir.rmdir()
+                    logging.info(f"Cleaned empty directory: {dest_dir}")
+            except Exception as e:
+                logging.error(f"Directory cleanup failed: {str(e)}")
+        else:
+            logging.info(f"File retained in downloads: {final_path}")
+
+        time.sleep(SCAN_DELAY)
+        trigger_media_scan(FINAL_LIBRARY_PATH)
+
+        with download_lock:
+            download_statuses[task_id]["status"] = "completed"
+
+    except Exception as e:
+        logging.error(f"Download failed: {str(e)}", exc_info=True)
+        with download_lock:
+            if task_id in download_statuses:  # Safety check
+                download_statuses[task_id].update({
+                    "status": "failed",
+                    "error": str(e)
+                })
+        if temp_path and temp_path.exists():
+            temp_path.unlink()
+        raise
 
 def get_plex_section_id():
     global plex_section_id, plex_initialized
     if plex_initialized:
         return plex_section_id
-
     try:
-        response = requests.get(
-            f"http://{PLEX_SERVER_IP}:32400/library/sections",
-            headers={"Accept": "application/json"},
-            params={"X-Plex-Token": PLEX_TOKEN},
-            timeout=10
-        )
+        response = requests.get(f"http://{PLEX_SERVER_IP}:32400/library/sections",
+                              headers={"Accept": "application/json"},
+                              params={"X-Plex-Token": PLEX_TOKEN},
+                              timeout=10)
         response.raise_for_status()
         for directory in response.json()["MediaContainer"]["Directory"]:
             if directory["title"] == PLEX_LIBRARY_NAME:
@@ -271,39 +352,40 @@ def trigger_plex_scan(path):
     try:
         section_id = get_plex_section_id()
         if not section_id:
-            logging.error("Plex section ID not resolved. Check library name or token.")
             return False
 
-        if ENABLE_DOWNLOADS:
-            base_path = FINAL_LIBRARY_PATH if MOVE_TO_FINAL_LIBRARY else DOWNLOAD_COMPLETE_PATH
+        # Partial scans for symlink mode
+        if not ENABLE_DOWNLOADS:
+            try:
+                base_path = SYMLINK_BASE_PATH
+                rel_path = path.relative_to(base_path)
+                encoded_path = "/".join([urllib.parse.quote(p.name) for p in rel_path.parents[::-1]][:-1])
+                params = {"path": encoded_path, "X-Plex-Token": PLEX_TOKEN}
+                scan_type = "partial"
+            except ValueError:
+                logging.error(f"Path {path} not in symlink base {base_path}")
+                params = {"X-Plex-Token": PLEX_TOKEN}
+                scan_type = "full"
         else:
-            base_path = SYMLINK_BASE_PATH
-
-        try:
-            rel_path = path.relative_to(base_path)
-            encoded_path = "/".join([urllib.parse.quote(p.name) for p in rel_path.parents[::-1]][:-1])
-        except ValueError:
-            logging.error(f"Path {path} is not relative to {base_path}. Check path mappings.")
-            return False
+            params = {"X-Plex-Token": PLEX_TOKEN}
+            scan_type = "full"
 
         response = requests.get(
             f"http://{PLEX_SERVER_IP}:32400/library/sections/{section_id}/refresh",
-            params={"path": encoded_path, "X-Plex-Token": PLEX_TOKEN},
+            params=params,
             timeout=15
         )
-        logging.info(f"Plex scan response code: {response.status_code}")
+        logging.info(f"Plex {scan_type} scan triggered")
         return response.status_code == 200
     except Exception as e:
-        logging.error(f"Plex scan error: {str(e)}", exc_info=True)
+        logging.error(f"Plex scan error: {str(e)}")
         return False
 
 def trigger_emby_scan(path):
     try:
-        libs_url = f"http://{EMBY_SERVER_IP}/emby/Library/VirtualFolders?api_key={EMBY_API_KEY}"
-        libs_response = requests.get(libs_url, timeout=10)
-        
+        libs_response = requests.get(f"http://{EMBY_SERVER_IP}/emby/Library/VirtualFolders?api_key={EMBY_API_KEY}",
+                                   timeout=10)
         if libs_response.status_code != 200:
-            logging.error(f"Emby API failed: {libs_response.status_code}")
             return False
 
         library_id = None
@@ -311,17 +393,11 @@ def trigger_emby_scan(path):
             if lib['Name'] == EMBY_LIBRARY_NAME:
                 library_id = lib['ItemId']
                 break
-
         if not library_id:
-            logging.error(f"Emby library '{EMBY_LIBRARY_NAME}' not found")
             return False
 
-        scan_url = f"http://{EMBY_SERVER_IP}/emby/Library/Refresh?api_key={EMBY_API_KEY}"
-        scan_response = requests.post(
-            scan_url,
-            params={"Recursive": "true", "Path": str(path)},
-            timeout=15
-        )
+        scan_response = requests.post(f"http://{EMBY_SERVER_IP}/emby/Library/Refresh?api_key={EMBY_API_KEY}",
+                                    timeout=15)
         return scan_response.status_code in [200, 204]
     except Exception as e:
         logging.error(f"Emby scan error: {str(e)}")
@@ -332,33 +408,18 @@ def trigger_media_scan(path):
         if MEDIA_SERVER == "plex":
             return trigger_plex_scan(path)
         elif MEDIA_SERVER == "emby":
-            if ENABLE_DOWNLOADS:
-                base_path = FINAL_LIBRARY_PATH if MOVE_TO_FINAL_LIBRARY else DOWNLOAD_COMPLETE_PATH
-            else:
-                base_path = SYMLINK_BASE_PATH
-            
-            try:
-                rel_path = path.relative_to(base_path)
-                emby_scan_path = base_path / rel_path.parent
-            except ValueError:
-                emby_scan_path = base_path
-            
-            return trigger_emby_scan(emby_scan_path)
+            return trigger_emby_scan(path)
         return False
     except Exception as e:
         logging.error(f"Media scan failed: {str(e)}")
         return False
 
-def process_symlink_creation(data):
+def process_symlink_creation(data, task_id):
     try:
-        headers = {"Authorization": f"Bearer {RD_API_KEY}"}
-        response = requests.get(
-            f"https://api.real-debrid.com/rest/1.0/torrents/info/{data['torrent_id']}",
-            headers=headers,
-            timeout=15
-        )
-        response.raise_for_status()
-        torrent_info = response.json()
+        torrent_id = data['torrent_id']
+        torrent_info = requests.get(f"https://api.real-debrid.com/rest/1.0/torrents/info/{torrent_id}",
+                                  headers={"Authorization": f"Bearer {RD_API_KEY}"},
+                                  timeout=15).json()
 
         if not torrent_info.get("files") or not torrent_info.get("filename"):
             return jsonify({"error": "Invalid torrent"}), 400
@@ -379,55 +440,75 @@ def process_symlink_creation(data):
                 dest_path = dest_dir / f"{clean_filename(file_path.stem)}{file_path.suffix.lower()}"
 
                 if ENABLE_DOWNLOADS:
-                    threading.Thread(
-                        target=log_download_speed,
-                        args=(data['torrent_id'], dest_path),
-                        daemon=True
-                    ).start()
+                    log_download_speed(task_id, torrent_id, dest_path)
                 else:
                     src_path = RCLONE_MOUNT_PATH / torrent_info["filename"] / file_path
-                    if dest_path.exists():
-                        logging.warning(f"Symlink already exists: {dest_path}")
-                    else:
+                    if not dest_path.exists():
                         dest_path.symlink_to(src_path)
                         logging.info(f"Symlink created: {dest_path} → {src_path}")
                     trigger_media_scan(dest_path)
 
                 created_paths.append(str(dest_path))
-
             except Exception as e:
                 logging.error(f"File error: {str(e)}")
 
         return jsonify({
-            "status": "success",
+            "status": "processed" if ENABLE_DOWNLOADS else "symlink_created",
             "created_paths": created_paths,
-            "scan_triggered": True
-        })
-
+            "task_id": task_id
+        }), 200
     except requests.RequestException as e:
-        logging.error(f"API error: {str(e)}")
         return jsonify({"error": "API failure"}), 502
     except Exception as e:
-        logging.error(f"Processing error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/symlink", methods=["POST"])
 def create_symlink():
+    data = request.get_json()
+    torrent_id = data.get("torrent_id")
+
+    with queue_lock:
+        current_torrent_ids = set(active_tasks.values())
+        current_torrent_ids.update(task[2] for task in request_queue)
+        if torrent_id in current_torrent_ids:
+            return jsonify({"error": "Task already in progress"}), 409
+
     if task_semaphore.acquire(blocking=False):
         try:
-            return process_symlink_creation(request.get_json())
+            task_id = str(uuid.uuid4())
+            with queue_lock:
+                active_tasks[task_id] = torrent_id
+            return process_symlink_creation(data, task_id)
         finally:
             task_semaphore.release()
+            with queue_lock:
+                if task_id in active_tasks:
+                    del active_tasks[task_id]
     else:
         task_id = str(uuid.uuid4())
         with queue_lock:
-            request_queue.append((task_id, request.get_data()))
-            active_tasks.add(task_id)
-        return jsonify({
-            "status": "queued",
-            "task_id": task_id,
-            "position": len(request_queue)
-        }), 429
+            request_queue.append((task_id, request.get_data(), torrent_id))
+            active_tasks[task_id] = torrent_id
+        return jsonify({"status": "queued", "task_id": task_id, "position": len(request_queue)}), 429
+
+@app.route("/task-status/<task_id>")
+def get_task_status(task_id):
+    with download_lock:
+        status_data = download_statuses.get(task_id, {})
+
+    compatible_status = {
+        "starting": "processing",
+        "downloading": "processing",
+        "completed": "processed",
+        "failed": "error"
+    }.get(status_data.get("status"), "unknown")
+
+    return jsonify({
+        "status": compatible_status,
+        "progress": status_data.get("progress", 0),
+        "speed_mbps": status_data.get("speed", 0)/1024/1024,
+        "filename": status_data.get("filename", ""),
+    })
 
 @app.route("/health")
 def health_check():
@@ -443,6 +524,4 @@ if __name__ == "__main__":
     workers = [TaskWorker() for _ in range(MAX_CONCURRENT_TASKS * 2)]
     for w in workers:
         w.start()
-
-    threading.Thread(target=log_total_speed, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5002")), threaded=True)
