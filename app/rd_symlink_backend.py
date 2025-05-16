@@ -109,36 +109,50 @@ def rd_proxy():
         response = requests.request(
             method,
             f"https://api.real-debrid.com/rest/1.0{endpoint}",
-            headers={"Authorization": f"Bearer {RD_API_KEY}"},
+            headers={
+                "Authorization": f"Bearer {RD_API_KEY}",
+                "Cache-Control": "no-store, max-age=0"
+            },
             data=payload,
             timeout=15
         )
+        
         try:
             response.raise_for_status()
 
             if response.status_code in [200, 202, 204] and not response.text.strip():
                 app.logger.info(f"Handled empty success response ({response.status_code})")
-                return jsonify({"status": "success"}), 200
+                resp = jsonify({"status": "success"})
+                resp.headers['Cache-Control'] = 'no-store, max-age=0'
+                return resp, 200
 
             try:
-                return jsonify(response.json()), response.status_code
+                resp = jsonify(response.json())
+                resp.headers['Cache-Control'] = 'no-store, max-age=0'
+                return resp, response.status_code
             except json.JSONDecodeError:
                 if response.status_code in [200, 202, 204]:
                     app.logger.info(f"Empty success response ({response.status_code})")
-                    return jsonify({"status": "success"}), 200
+                    resp = jsonify({"status": "success"})
+                    resp.headers['Cache-Control'] = 'no-store, max-age=0'
+                    return resp, 200
                 app.logger.error(f"Invalid JSON response | Status: {response.status_code} | Content: {response.text[:200]}")
-                return jsonify({
+                resp = jsonify({
                     "source": "Real-Debrid API",
                     "status": response.status_code,
                     "message": response.text
-                }), response.status_code
+                })
+                resp.headers['Cache-Control'] = 'no-store, max-age=0'
+                return resp, response.status_code
         except requests.HTTPError as e:
             error_data = {
                 "source": "Real-Debrid API",
                 "status": e.response.status_code,
                 "message": e.response.text
             }
-            return jsonify(error_data), e.response.status_code
+            resp = jsonify(error_data)
+            resp.headers['Cache-Control'] = 'no-store, max-age=0'
+            return resp, e.response.status_code
 
     except Exception as e:
         error_details = {
@@ -149,12 +163,16 @@ def rd_proxy():
         }
         if hasattr(e, 'response') and e.response.status_code in [200, 202, 204]:
             app.logger.info(f"Handled proxy error for success code: {json.dumps(error_details, indent=2)}")
-            return jsonify({"status": "success"}), 200
+            resp = jsonify({"status": "success"})
+            resp.headers['Cache-Control'] = 'no-store, max-age=0'
+            return resp, 200
         app.logger.error(f"Proxy Error Details:\n{json.dumps(error_details, indent=2)}")
-        return jsonify({
+        resp = jsonify({
             "error": "Proxy processing failed",
             "details": str(e)
-        }), 500
+        })
+        resp.headers['Cache-Control'] = 'no-store, max-age=0'
+        return resp, 500
 
 def get_restricted_links(torrent_id):
     response = requests.get(f"https://api.real-debrid.com/rest/1.0/torrents/info/{torrent_id}",
@@ -183,7 +201,6 @@ def clean_filename(original_name):
 def log_download_speed(task_id, torrent_id, dest_path):
     temp_path = None
     try:
-        # Initialize status entry first
         with download_lock:
             download_statuses[task_id] = {
                 "status": "starting",
@@ -317,7 +334,7 @@ def log_download_speed(task_id, torrent_id, dest_path):
     except Exception as e:
         logging.error(f"Download failed: {str(e)}", exc_info=True)
         with download_lock:
-            if task_id in download_statuses:  # Safety check
+            if task_id in download_statuses:
                 download_statuses[task_id].update({
                     "status": "failed",
                     "error": str(e)
@@ -354,7 +371,6 @@ def trigger_plex_scan(path):
         if not section_id:
             return False
 
-        # Partial scans for symlink mode
         if not ENABLE_DOWNLOADS:
             try:
                 base_path = SYMLINK_BASE_PATH
@@ -415,6 +431,15 @@ def trigger_media_scan(path):
         return False
 
 def process_symlink_creation(data, task_id):
+    with download_lock:
+        if task_id not in download_statuses:
+            download_statuses[task_id] = {
+                "status": "queued",
+                "progress": 0,
+                "speed": 0,
+                "error": None
+            }
+
     try:
         torrent_id = data['torrent_id']
         torrent_info = requests.get(f"https://api.real-debrid.com/rest/1.0/torrents/info/{torrent_id}",

@@ -1,8 +1,7 @@
-// === USERSCRIPT.TXT ===
 // ==UserScript==
 // @name         RD Symlink Manager
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      3.0
 // @description  Universal Real-Debrid client with symlink support
 // @author       Your Name
 // @match        *://*/*
@@ -31,44 +30,39 @@
         syncInterval: 1000
     };
 
-async function rdProxy(endpoint, method = 'GET', data = null) {
-    try {
-        const response = await new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
-                method: 'POST',
-                url: `${CONFIG.backendUrl}/rd-proxy`,
-                headers: {'Content-Type': 'application/json'},
-                data: JSON.stringify({ endpoint, method, data }),
-                onload: (res) => {
-                    try {
-                        // Handle empty responses
-                        if (!res.responseText.trim()) {
-                            throw new Error(`Empty response (${res.status})`);
+    async function rdProxy(endpoint, method = 'GET', data = null) {
+        try {
+            const response = await new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method: 'POST',
+                    url: `${CONFIG.backendUrl}/rd-proxy`,
+                    headers: {'Content-Type': 'application/json'},
+                    data: JSON.stringify({ endpoint, method, data }),
+                    onload: (res) => {
+                        try {
+                            if (!res.responseText.trim()) throw new Error(`Empty response (${res.status})`);
+                            const data = JSON.parse(res.responseText);
+                            if (res.status >= 200 && res.status < 300) resolve(data);
+                            else {
+                                const errorDetails = [
+                                    data.source && `Source: ${data.source}`,
+                                    data.status && `Status: ${data.status}`,
+                                    data.message || data.error
+                                ].filter(Boolean).join(' | ');
+                                reject(errorDetails);
+                            }
+                        } catch(e) {
+                            reject(`Invalid server response: ${res.responseText.slice(0, 100)}`);
                         }
-
-                        const data = JSON.parse(res.responseText);
-                        if (res.status >= 200 && res.status < 300) {
-                            resolve(data);
-                        } else {
-                            const errorDetails = [
-                                data.source && `Source: ${data.source}`,
-                                data.status && `Status: ${data.status}`,
-                                data.message || data.error
-                            ].filter(Boolean).join(' | ');
-                            reject(errorDetails);
-                        }
-                    } catch(e) {
-                        reject(`Invalid server response: ${res.responseText.slice(0, 100)}`);
-                    }
-                },
-                onerror: (err) => reject(`Connection failed: ${err.statusText}`)
+                    },
+                    onerror: (err) => reject(`Connection failed: ${err.statusText}`)
+                });
             });
-        });
-        return response;
-    } catch (error) {
-        throw new Error(`Real-Debrid Error: ${error}`);
+            return response;
+        } catch (error) {
+            throw new Error(`Real-Debrid Error: ${error}`);
+        }
     }
-}
 
     GM_registerMenuCommand('⚙️ Configure RD Manager', () => {
         const url = prompt('Enter backend URL (http(s)://your-domain.com):', CONFIG.backendUrl);
@@ -115,10 +109,22 @@ async function rdProxy(endpoint, method = 'GET', data = null) {
             activeTasks = storedActiveTasks;
             changed = true;
             Object.values(activeTasks).forEach(task => {
-                if (['pending', 'processing', 'downloading', 'symlinking'].includes(task.status) && !task._isProcessing) {
-                    task._isProcessing = true;
-                    startProcessing(task.magnet, null, task.mode, task.id)
-                        .catch(() => updateTask(task.id, { status: 'failed' }));
+                task._isProcessing = false;
+                if (['pending', 'processing', 'downloading', 'symlinking'].includes(task.status)) {
+                    if (!task._isProcessing) {
+                        task._isProcessing = true;
+                        startProcessing(task.magnet, null, task.mode, task.id)
+                            .catch(() => updateTask(task.id, { status: 'failed' }));
+                    }
+                }
+                if (task.status === 'downloading') {
+                    rdProxy(`/torrents/info/${task.rdTorrentId}`)
+                        .then(freshData => {
+                            updateTask(task.id, {
+                                progress: 35 + (freshData.progress * 0.65),
+                                statusText: `Resumed: ${freshData.progress}%`
+                            });
+                        });
                 }
             });
         }
@@ -428,18 +434,22 @@ async function rdProxy(endpoint, method = 'GET', data = null) {
             let lastProgress = task?.progress || 0;
             while (activeTasks[taskId]) {
                 const downloadStatus = await rdProxy(`/torrents/info/${rdTorrentId}`);
-                updateTask(taskId, { downloadStatus });
                 const currentProgress = Math.round(downloadStatus.progress);
-                if (currentProgress !== lastProgress) {
-                    updateTask(taskId, {
-                        status: 'downloading',
-                        progress: 35 + (currentProgress * 0.65),
-                        statusText: `Downloading: ${currentProgress}% (${formatSpeed(downloadStatus.speed)})`
-                    });
-                    lastProgress = currentProgress;
+                const isDownloadComplete = ['downloaded', 'seeding'].includes(downloadStatus.status);
+                const visualProgress = isDownloadComplete ? 100 : 35 + (currentProgress * 0.65);
+
+                updateTask(taskId, {
+                    downloadStatus,
+                    status: 'downloading',
+                    progress: Math.min(visualProgress, 100),
+                    statusText: isDownloadComplete ? 'Verifying download'
+                        : `Downloading: ${currentProgress}% (${formatSpeed(downloadStatus.speed)})`
+                });
+
+                if (isDownloadComplete) {
+                    updateTask(taskId, { progress: 100, statusText: 'Download verified' });
+                    break;
                 }
-                if (['downloaded', 'seeding'].includes(downloadStatus.status)) break;
-                if (['error', 'virus'].includes(downloadStatus.status)) throw new Error(downloadStatus.status);
                 await new Promise(r => setTimeout(r, 3000));
             }
             if (mode === 'symlink') {
@@ -448,13 +458,19 @@ async function rdProxy(endpoint, method = 'GET', data = null) {
                     completeTask(taskId, true, task.result);
                     return;
                 }
-                updateTask(taskId, { status: 'symlinking', progress: 95, statusText: 'Finalizing symlink...' });
+                updateTask(taskId, { status: 'symlinking', statusText: 'Finalizing symlink...' });
                 const fullPath = videoFiles[0].path || '';
                 const fileName = fullPath.split(/[\\/]/).pop();
                 const [baseName] = fileName.match(/(.*?)(\.[^.]*)?$/) || [fileName];
                 const cleanDirName = baseName.replace(/[<>:"/\\|?*]/g, '_').substring(0, 200);
                 try {
-                    const symlinkResult = await backendAPI('/symlink', { hash, filename: cleanDirName, torrent_id: rdTorrentId });
+                    const symlinkResult = await backendAPI('/symlink', {
+                        hash,
+                        filename: cleanDirName,
+                        torrent_id: rdTorrentId,
+                        file_size: videoFiles[0].bytes,
+                        file_index: videoFiles[0].id
+                    });
                     const symlinkPath = symlinkResult.path || `${symlinkResult.directory}/${fileName}`;
                     if (!symlinkPath) throw new Error('Symlink path not received');
                     GM_setClipboard(symlinkPath);
@@ -468,15 +484,15 @@ async function rdProxy(endpoint, method = 'GET', data = null) {
                     } else throw error;
                 }
             } else completeTask(taskId, true);
-} catch (error) {
-    const message = error.message.replace('Real-Debrid Error: ', '');
-    completeTask(taskId, false, { error: message });
-    if (button) {
-        button.textContent = '✗ Failed';
-        button.style.background = '#e74c3c';
-    }
-    showStatus(`Failed: ${message}`, '#e74c3c', 5000);
-}
+        } catch (error) {
+            const message = error.message.replace('Real-Debrid Error: ', '');
+            completeTask(taskId, false, { error: message });
+            if (button) {
+                button.textContent = '✗ Failed';
+                button.style.background = '#e74c3c';
+            }
+            showStatus(`Failed: ${message}`, '#e74c3c', 5000);
+        }
     }
 
     function formatSpeed(bytesPerSecond) {
@@ -583,6 +599,17 @@ async function rdProxy(endpoint, method = 'GET', data = null) {
         createTaskManager();
         createTaskManagerToggle();
         updateTaskManager();
+        setTimeout(() => {
+            // Force process all active tasks on initial load
+            Object.values(activeTasks).forEach(task => {
+                if (['pending', 'processing', 'downloading', 'symlinking'].includes(task.status)) {
+                    task._isProcessing = false;
+                    startProcessing(task.magnet, null, task.mode, task.id)
+                        .catch(() => updateTask(task.id, { status: 'failed' }));
+                }
+            });
+            updateTaskManager();
+        }, 2000);
         const processMagnetLinks = () => {
             uw.document.querySelectorAll('a[href^="magnet:"]').forEach(link => {
                 if (!link.nextElementSibling?.classList?.contains('rd-magnet-button')) {
